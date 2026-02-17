@@ -1,0 +1,6 @@
+TDS:Place("Trapper", 15.94632, 0.98652, -10.49811)
+TDS:Upgrade(1)
+TDS:Place("Trapper", 2.56834, 0.97404, -10.01812)
+TDS:Upgrade(1)
+TDS:Upgrade(2)
+TDS:Upgrade(2)
