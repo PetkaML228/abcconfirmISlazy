@@ -1,0 +1,30 @@
+--[[
+    Скрипт проверки окружения.
+    Логика: Через 20 секунд после инжекта проверяет наличие папки 'Elevators' в Workspace.
+    Если папка найдена — игрок будет исключен с сервера.
+]]
+
+local function checkEnvironment()
+    -- Ждем 20 секунд перед проверкой
+    task.wait(120)
+
+    -- Ссылка на Workspace
+    local workspace = game:GetService("Workspace")
+    local players = game:GetService("Players")
+    local localPlayer = players.LocalPlayer
+
+    -- Поиск объекта с именем 'Elevators'
+    -- Мы используем FindFirstChild, чтобы избежать ошибок, если объекта нет
+    local elevatorsFolder = workspace:FindFirstChild("Elevators")
+
+    if elevatorsFolder then
+        -- Если объект найден, кикаем игрока с уведомлением
+        localPlayer:Kick("\n[Система защиты]\nОбнаружена запрещенная папка 'Elevators' в Workspace.\nСоединение разорвано в целях безопасности.")
+    else
+        -- Опционально: вывод в консоль для отладки (можно удалить)
+        print("Проверка завершена: Папка 'Elevators' не найдена. Работа продолжается.")
+    end
+end
+
+-- Запуск проверки в отдельном потоке, чтобы основной поток чита нативного выполнения не завис
+task.spawn(checkEnvironment)
