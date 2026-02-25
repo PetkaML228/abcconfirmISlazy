@@ -4,7 +4,7 @@ TDS:Loadout("Assassin", "Trapper", "None", "None", "None")
 TDS:Mode("Pizza Party")
 
 TDS:Ready()
-TDS:VoteSkip(1, 30)
+TDS:VoteSkip(1)
 TDS:VoteSkip(2)
 TDS:VoteSkip(3)
 TDS:VoteSkip(4)
