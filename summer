@@ -42,7 +42,7 @@ TDS:VoteSkip(33)
 TDS:VoteSkip(34)
 TDS:VoteSkip(35, 100)
 TDS:VoteSkip(36)
-TDS:VoteSkip(37)
+TDS:VoteSkip(37, 95)
 TDS:VoteSkip(38)
 TDS:VoteSkip(39, 90)
 
