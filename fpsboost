@@ -1,0 +1,79 @@
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+local lagEnabled = true -- Enabled by default
+
+local Lighting = game:GetService("Lighting")
+local originalSettings = {
+    GlobalShadows = Lighting.GlobalShadows,
+    Brightness = Lighting.Brightness,
+    FogEnd = Lighting.FogEnd,
+    OutdoorAmbient = Lighting.OutdoorAmbient,
+}
+
+local function enableLag()
+    lagEnabled = true
+    pcall(function()
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 9e9
+        Lighting.Brightness = 1
+        Lighting.OutdoorAmbient = Color3.new(1,1,1)
+        for _, v in ipairs(Lighting:GetChildren()) do
+            if v:IsA("BlurEffect") or v:IsA("SunRaysEffect") or v:IsA("BloomEffect") or v:IsA("ColorCorrectionEffect") then
+                v.Enabled = false
+            end
+        end
+    end)
+    for _, v in ipairs(workspace:GetDescendants()) do
+        if not v:IsDescendantOf(player.Character) then
+            if v:IsA("ParticleEmitter") or v:IsA("Smoke") or v:IsA("Fire") then
+                v.Enabled = false
+            end
+        end
+    end
+end
+
+local function disableLag()
+    lagEnabled = false
+    pcall(function()
+        Lighting.GlobalShadows = originalSettings.GlobalShadows
+        Lighting.Brightness = originalSettings.Brightness
+        Lighting.FogEnd = originalSettings.FogEnd
+        Lighting.OutdoorAmbient = originalSettings.OutdoorAmbient
+    end)
+end
+
+-- Function to refresh lag reduction effects
+local function refreshLagReduction()
+    if lagEnabled then
+        -- Re-apply lag reduction settings
+        pcall(function()
+            Lighting.GlobalShadows = false
+            Lighting.FogEnd = 9e9
+            Lighting.Brightness = 1
+            Lighting.OutdoorAmbient = Color3.new(1,1,1)
+            for _, v in ipairs(Lighting:GetChildren()) do
+                if v:IsA("BlurEffect") or v:IsA("SunRaysEffect") or v:IsA("BloomEffect") or v:IsA("ColorCorrectionEffect") then
+                    v.Enabled = false
+                end
+            end
+        end)
+        
+        -- Disable particles in workspace
+        for _, v in ipairs(workspace:GetDescendants()) do
+            if not v:IsDescendantOf(player.Character) then
+                if v:IsA("ParticleEmitter") or v:IsA("Smoke") or v:IsA("Fire") then
+                    v.Enabled = false
+                end
+            end
+        end
+    end
+end
+
+-- Enable lag reduction by default on startup
+enableLag()
+
+-- Set up refresh loop
+while true do
+    refreshLagReduction()
+    wait(10) -- Refresh every 15 seconds
+end
