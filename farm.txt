@@ -1,8 +1,6 @@
 loadstring(game:HttpGet("https://raw.githubusercontent.com/PetkaML228/abcconfirmISlazy/refs/heads/main/pizza4k"))()
 task.wait(2)
 setfpscap(25)
-task.wait(1)
-loadstring(game:HttpGet('https://raw.githubusercontent.com/nullus7/reconnect/refs/heads/main/checkonline.lua'))()
 task.wait(2)
 loadstring(game:HttpGet('https://raw.githubusercontent.com/PetkaML228/abcconfirmISlazy/refs/heads/main/kick6m'))()
 task.wait(2)
