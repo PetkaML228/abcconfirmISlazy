@@ -1,6 +1,4 @@
 loadstring(game:HttpGet("https://raw.githubusercontent.com/PetkaML228/abcconfirmISlazy/refs/heads/main/12kh"))()
-task.wait(20)
-loadstring(game:HttpGet("https://raw.githubusercontent.com/DeadSignalFound/Library/refs/heads/main/AutoGatlin.lua"))()
 task.wait(2)
 loadstring(game:HttpGet("https://raw.githubusercontent.com/PetkaML228/abcconfirmISlazy/refs/heads/main/fpsboost"))()
 task.wait(2)
