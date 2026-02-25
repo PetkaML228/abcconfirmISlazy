@@ -1,0 +1,48 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local localPlayer = Players.LocalPlayer
+
+local DELAY = 1.5
+local necroTimers = {}
+
+local remoteFunc = game:GetService("ReplicatedStorage"):FindFirstChild("RemoteFunction")
+
+RunService.Heartbeat:Connect(function()
+    local currentTime = tick()
+    local towers = workspace:FindFirstChild("Towers")
+    if not towers then return end
+    
+    for _, tower in pairs(towers:GetChildren()) do
+        local rep = tower:FindFirstChild("TowerReplicator")
+        if not rep then continue end
+        
+        if rep:GetAttribute("Name") == "Necromancer" and rep:GetAttribute("OwnerId") == localPlayer.UserId then
+            local currentAmmo = rep:GetAttribute("Ammo") or 0
+            local maxAmmo = rep:GetAttribute("MaxAmmo") or 1
+            
+            if currentAmmo == maxAmmo then
+                if not necroTimers[tower] then
+                    necroTimers[tower] = currentTime
+                else
+                    if currentTime - necroTimers[tower] >= DELAY then
+                        if remoteFunc then
+                            remoteFunc:InvokeServer(
+                                "Troops",
+                                "Abilities",
+                                "Activate",
+                                { 
+                                    Troop = tower, 
+                                    Name = "Raise The Dead", 
+                                    Data = {} 
+                                }
+                            )
+                        end
+                        necroTimers[tower] = nil
+                    end
+                end
+            else
+                necroTimers[tower] = nil
+            end
+        end
+    end
+end) 
