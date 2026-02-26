@@ -1,3 +1,4 @@
+task. wait(10)
 local TDS = loadstring(game:HttpGet("https://raw.githubusercontent.com/DuxiiT/auto-strat/refs/heads/main/Library.lua"))()
 TDS:Addons()
 TDS:Loadout("Commander", "Scout", "DJ Booth", "Gatling Gun", "Hacker")
