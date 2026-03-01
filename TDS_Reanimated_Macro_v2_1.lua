@@ -458,88 +458,56 @@ Gen.Difficulty = function(Args, Timer)
 end
 
 -- ════════════════════════════════════════════════════════════════
---  hookmetamethod — ЯДРО RECORDER
+--  ИСПРАВЛЕННЫЙ hookmetamethod — ЯДРО RECORDER (v2.2)
 -- ════════════════════════════════════════════════════════════════
---
---  Логика перехвата:
---
---  ┌─────────────────────────────────────────────────────────┐
---  │ Вызов "Troops" / "Waves"                                │
---  │   → Оборачиваем в корутину                              │
---  │   → Выполняем RF, получаем результат                    │
---  │   → Записываем действие с результатом                   │
---  │   → Возвращаем результат игре                           │
---  ├─────────────────────────────────────────────────────────┤
---  │ Вызов "Difficulty"                                      │
---  │   → НЕ оборачиваем в корутину (это ломало игру!)        │
---  │   → Выполняем RF нормально через OldNamecall            │
---  │   → Записываем асинхронно в task.spawn                  │
---  │   → Игровой модуль Difficulties работает без ошибок     │
---  ├─────────────────────────────────────────────────────────┤
---  │ Все остальные вызовы                                    │
---  │   → Пропускаем без изменений (OldNamecall)              │
---  └─────────────────────────────────────────────────────────┘
-
--- Вызовы, которые используют корутину (нужен результат RF)
-local CoroutineActions = {
-    Place   = Gen.Place,
-    Upgrade = Gen.Upgrade,
-    Sell    = Gen.Sell,
-    Target  = Gen.Target,
-}
 
 local OldNamecall
-OldNamecall = hookmetamethod(game, "__namecall", function(...)
-    local self = (...)
-    local args = { select(2, ...) }
+OldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+    local args = {...}
+    local method = getnamecallmethod()
 
-    -- Работаем только с RemoteFunction во время записи
-    if self.Name ~= "RemoteFunction"
-    or getnamecallmethod() ~= "InvokeServer"
-    or not MacroState.IsRecording
-    then
-        return OldNamecall(...)
+    -- Проверяем, что это RemoteFunction и идет запись
+    if (method ~= "InvokeServer") or (not MacroState.IsRecording) then
+        return OldNamecall(self, ...)
     end
 
-    local category = args[1]  -- "Troops" / "Waves" / "Difficulty" / ...
-    local action   = args[2]  -- "Place" / "Upgrade" / "Sell" / "Skip" / "Vote" / ...
-
-    -- ── "Difficulty" "Vote" — асинхронная запись, НЕ корутина ──
-    if category == "Difficulty" and action == "Vote" then
-        -- Снимаем таймер ДО вызова (точный момент)
-        local timer = GetTimer()
-        -- Записываем асинхронно — не мешаем игровому коду
-        task.spawn(Gen.Difficulty, args, timer)
-        -- Выполняем оригинальный вызов без изменений
-        return OldNamecall(...)
+    -- Проверяем, что вызывается именно игровая RemoteFunction из ReplicatedStorage
+    if self.Name ~= "RemoteFunction" then 
+        return OldNamecall(self, ...) 
     end
 
-    -- ── "Waves" "Skip" — пропуск волны ──
-    if category == "Waves" and action == "Skip" then
-        local thread = coroutine.running()
-        coroutine.wrap(function(a)
-            local timer    = GetTimer()
-            local result   = self:InvokeServer(table.unpack(a))
-            Gen.Skip(a, timer)
-            coroutine.resume(thread, result)
-        end)(args)
-        return coroutine.yield()
-    end
+    local category = args[1] -- "Troops", "Waves", "Difficulty" [cite: 17, 19]
+    local action   = args[2] -- "Place", "Upgrade", "Sell", "Skip" [cite: 17, 18, 19]
 
-    -- ── "Troops" — размещение, апгрейд, продажа, цель ──
-    if category == "Troops" and CoroutineActions[action] then
-        local thread = coroutine.running()
-        coroutine.wrap(function(a)
-            local timer  = GetTimer()
-            local result = self:InvokeServer(table.unpack(a))
-            CoroutineActions[action](a, timer, result)
-            coroutine.resume(thread, result)
-        end)(args)
-        return coroutine.yield()
-    end
+    -- 1. Снимаем таймер до вызова
+    local timer = GetTimer()
 
-    -- ── Всё остальное — пропускаем без изменений ──
-    return OldNamecall(...)
+    -- 2. Выполняем оригинальный вызов СРАЗУ (без yield)
+    local result = OldNamecall(self, ...)
+
+    -- 3. Асинхронно записываем результат, если действие нам интересно
+    task.spawn(function()
+        if category == "Difficulty" and action == "Vote" then
+            Gen.Difficulty(args, timer)
+        
+        elseif category == "Waves" and action == "Skip" then
+            Gen.Skip(args, timer)
+            
+        elseif category == "Troops" then
+            if action == "Place" and typeof(result) == "Instance" then
+                Gen.Place(args, timer, result)
+            elseif action == "Upgrade" and result == true then
+                Gen.Upgrade(args, timer, result)
+            elseif action == "Sell" then
+                Gen.Sell(args, timer, result)
+            elseif action == "Target" and result == true then
+                Gen.Target(args, timer, result)
+            end
+        end
+    end)
+
+    -- 4. Возвращаем результат игре мгновенно
+    return result
 end)
 
 -- ─── Авто-пропуск волн во время записи ───────────────────────
