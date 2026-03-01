@@ -1425,4 +1425,184 @@ TabPlay:CreateButton({
             end)
         end)
         
+        if ok then
+            PlayStatusLbl:Set("▶ " .. PlayFileName)
+            Rayfield:Notify({
+                Title   = "Воспроизведение начато",
+                Content = PlayFileName,
+                Duration = 3,
+            })
+        else
+            PlayStatusLbl:Set("❌ " .. msg)
+        end
+    end,
+})
+
+TabPlay:CreateButton({
+    Name     = "⏸ Пауза / Продолжить",
+    Callback = function()
+        if not Playback.Active then
+            PlayStatusLbl:Set("❌ Воспроизведение не идёт")
+            return
+        end
         
+        local paused = Playback:TogglePause()
+        PlayStatusLbl:Set(paused and "⏸ Пауза" or "▶ Продолжение")
+    end,
+})
+
+TabPlay:CreateButton({
+    Name     = "⬛ Остановить",
+    Callback = function()
+        Playback:Stop()
+        PlayStatusLbl:Set("⬛ Остановлено")
+        PlayProgress:Set("Прогресс: —")
+    end,
+})
+
+-- ═══════ ВКЛАДКА: АВТО-ФУНКЦИИ ═══════
+
+local TabAuto = Window:CreateTab("Авто-функции", 4483362458)
+
+local AutoSellLbl = TabAuto:CreateLabel("Авто-продажа: ВЫКЛ")
+
+TabAuto:CreateToggle({
+    Name         = "Авто-продажа ферм (макс. уровень)",
+    CurrentValue = false,
+    Flag         = "AutoSellToggle",
+    Callback = function(enabled)
+        if enabled then
+            AutoSellFarm:Start()
+            AutoSellLbl:Set("Авто-продажа: ВКЛ ✅")
+        else
+            AutoSellFarm:Stop()
+            AutoSellLbl:Set("Авто-продажа: ВЫКЛ ❌")
+        end
+    end,
+})
+
+TabAuto:CreateParagraph({
+    Title   = "Как работает",
+    Content = "Автоматически продаёт ваши фермы,\n" ..
+              "когда они достигают максимального уровня.\n" ..
+              "Проверка каждые " .. CONFIG.AutoSellDelay .. " секунд.",
+})
+
+-- ═══════ ВКЛАДКА: ФАЙЛЫ ═══════
+
+local TabFiles = Window:CreateTab("Файлы", 4483362458)
+
+local FilesInfoLbl = TabFiles:CreateLabel("Папка: " .. CONFIG.MacroFolder)
+
+TabFiles:CreateButton({
+    Name     = "📋 Показать все файлы",
+    Callback = function()
+        local files = FileManager.List()
+        if #files == 0 then
+            FilesInfoLbl:Set("Нет сохранённых макросов")
+            return
+        end
+        
+        print("═══ Макро-файлы ═══")
+        for i, f in ipairs(files) do
+            print(string.format("  %d. %s", i, f))
+        end
+        print("════════════════════")
+        
+        FilesInfoLbl:Set("Файлов: " .. #files .. " (см. консоль)")
+    end,
+})
+
+local DeleteFileName = ""
+
+TabFiles:CreateInput({
+    Name            = "Удалить файл",
+    PlaceholderText = "Имя файла для удаления...",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        DeleteFileName = text
+    end,
+})
+
+TabFiles:CreateButton({
+    Name     = "🗑 Удалить",
+    Callback = function()
+        if DeleteFileName == "" then
+            FilesInfoLbl:Set("❌ Введите имя файла")
+            return
+        end
+        
+        if FileManager.Delete(DeleteFileName) then
+            FilesInfoLbl:Set("✓ Удалён: " .. DeleteFileName)
+            -- Обновляем dropdown
+            local newOptions = GetFileOptions()
+            PlayDropdown:Set(newOptions)
+        else
+            FilesInfoLbl:Set("❌ Файл не найден: " .. DeleteFileName)
+        end
+    end,
+})
+
+TabFiles:CreateButton({
+    Name     = "📖 Прочитать файл в консоль",
+    Callback = function()
+        if DeleteFileName == "" then
+            FilesInfoLbl:Set("❌ Введите имя файла")
+            return
+        end
+        
+        local content = FileManager.Read(DeleteFileName)
+        if content then
+            print("═══ Содержимое: " .. DeleteFileName .. " ═══")
+            print(content)
+            print("═══════════════════════════════════════════")
+            FilesInfoLbl:Set("✓ Выведено в консоль")
+        else
+            FilesInfoLbl:Set("❌ Файл не найден")
+        end
+    end,
+})
+
+-- ═══════ ВКЛАДКА: ИНФОРМАЦИЯ ═══════
+
+local TabInfo = Window:CreateTab("Информация", 4483362458)
+
+TabInfo:CreateParagraph({
+    Title   = "TDS: Reanimated Macro v" .. CONFIG.Version,
+    Content = "Макро-система для TDS: Reanimated\n" ..
+              "Основана на Strategies-X\n\n" ..
+              "Возможности:\n" ..
+              "• Запись действий (Place/Upgrade/Sell/Target)\n" ..
+              "• Воспроизведение макросов\n" ..
+              "• Пауза/Стоп воспроизведения\n" ..
+              "• Авто-продажа ферм\n" ..
+              "• Управление файлами макросов",
+})
+
+TabInfo:CreateParagraph({
+    Title   = "Формат макро-файла",
+    Content = 'TDS:Place("Name", x, y, z, wave, min, sec, "tc", rx, ry, rz)\n' ..
+              'TDS:Upgrade(id, wave, min, sec, "tc")\n' ..
+              'TDS:Sell(id, wave, min, sec, "tc")\n' ..
+              'TDS:Target(id, "priority", wave, min, sec, "tc")',
+})
+
+TabInfo:CreateLabel("Wave: " .. WaveTimer.GetWave())
+TabInfo:CreateLabel("RF: " .. tostring(GameBridge.GetRF() ~= nil and "✓" or "✗"))
+
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 12: ФИНАЛИЗАЦИЯ
+-- ═══════════════════════════════════════════════
+
+print(string.format(
+    "[TDS Macro v%s] ✓ Загружен | RF: %s | Папка: %s",
+    CONFIG.Version,
+    GameBridge.GetRF() and "найдена" or "НЕ НАЙДЕНА",
+    CONFIG.MacroFolder
+))
+
+Rayfield:Notify({
+    Title    = "TDS Macro v" .. CONFIG.Version,
+    Content  = "Скрипт загружен успешно!",
+    Duration = 5,
+})
