@@ -1,17 +1,25 @@
 --[[
-    TDS: Reanimated — Macro v2.3.0
-    Rayfield UI + Запись / Воспроизведение / Авто-продажа ферм
-    Fixes:
-      1. upgradeGui Clone error — pcall + selectTroop
-      2. Place pattern mismatch — tc в кавычках + гибкий парсер
-      3. GetWave() — GUI приоритет
-      4. continue → правильная структура if/elseif
-      5. Rayfield UI
+    ╔══════════════════════════════════════════════╗
+    ║   TDS: Reanimated — Macro System v3.0.0     ║
+    ║   Rayfield UI | Record | Playback | Auto    ║
+    ╠══════════════════════════════════════════════╣
+    ║   Основан на Strategies-X (адаптация)       ║
+    ║   Для TDS: Reanimated (старая версия TDS)   ║
+    ╚══════════════════════════════════════════════╝
+    
+    Структура:
+    1. Инициализация сервисов и переменных
+    2. Утилиты (файлы, таймеры, волны)
+    3. Recorder — запись действий игрока
+    4. Playback — воспроизведение макроса
+    5. AutoFarm — авто-продажа ферм
+    6. Rayfield UI — интерфейс
 ]]
 
--------------------------------------------------
---  СЕРВИСЫ
--------------------------------------------------
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 1: СЕРВИСЫ И ИНИЦИАЛИЗАЦИЯ
+-- ═══════════════════════════════════════════════
+
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService        = game:GetService("RunService")
@@ -19,752 +27,1235 @@ local UserInputService  = game:GetService("UserInputService")
 local HttpService       = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
--------------------------------------------------
---  RAYFIELD UI
--------------------------------------------------
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 2: RAYFIELD UI ЗАГРУЗКА
+-- ═══════════════════════════════════════════════
+
 local Rayfield = loadstring(game:HttpGet(
     "https://sirius.menu/rayfield"
 ))()
 
--------------------------------------------------
---  КОНСТАНТЫ
--------------------------------------------------
-local VERSION       = "2.3.0"
-local MACRO_FOLDER  = "TDS_Macros"
-local TIMEOUT_TOWER = 45
-local TIMEOUT_WAVE  = 300
-local POLL_INTERVAL = 0.15
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 3: КОНСТАНТЫ И КОНФИГУРАЦИЯ
+-- ═══════════════════════════════════════════════
 
--------------------------------------------------
---  УТИЛИТЫ ФАЙЛОВ
--------------------------------------------------
-if not isfolder(MACRO_FOLDER) then makefolder(MACRO_FOLDER) end
+local CONFIG = {
+    Version       = "3.0.0",
+    MacroFolder   = "TDS_Macros",        -- папка для сохранения макросов
+    TimeoutTower  = 45,                   -- сек. ожидания башни при воспроизведении
+    TimeoutWave   = 600,                  -- сек. ожидания волны
+    PollInterval  = 0.1,                  -- интервал проверки состояния
+    ActionDelay   = 0.15,                 -- задержка между действиями
+    AutoSellDelay = 2,                    -- интервал проверки авто-продажи
+}
 
-local function FilePath(name)
-    return MACRO_FOLDER .. "/" .. name
-end
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 4: ФАЙЛОВАЯ СИСТЕМА
+-- ═══════════════════════════════════════════════
 
-local function FileWrite(name, text)
-    writefile(FilePath(name), text)
-end
+--[[
+    FileManager — обёртка над файловыми функциями эксплоита.
+    Все макросы хранятся в папке TDS_Macros/ как .lua файлы.
+]]
+local FileManager = {}
 
-local function FileAppend(name, text)
-    appendfile(FilePath(name), text .. "\n")
-end
-
-local function FileRead(name)
-    return readfile(FilePath(name))
-end
-
-local function FileExists(name)
-    return isfile(FilePath(name))
-end
-
-local function FileList()
-    local out = {}
-    for _, v in ipairs(listfiles(MACRO_FOLDER)) do
-        local n = v:match("[/\\]([^/\\]+)$")
-        if n then table.insert(out, n) end
-    end
-    return out
-end
-
--------------------------------------------------
---  ИГРОВЫЕ ССЫЛКИ
--------------------------------------------------
-local GameRF       = nil
-local RSWave       = nil
-local RSTimer      = nil
-local TroopsFolder = nil
-
-local function EnsureRemote()
-    if GameRF then return GameRF end
-    local rf = ReplicatedStorage:WaitForChild("RemoteFunctions", 10)
-    if rf then
-        GameRF = rf:WaitForChild("Troops", 10)
-    end
-    if not GameRF then
-        warn("[Macro] RemoteFunction 'Troops' не найдена")
-    end
-    return GameRF
-end
-
-local function EnsureState()
-    if RSWave then return end
-    local state = ReplicatedStorage:WaitForChild("State", 15)
-    if state then
-        RSWave  = state:FindFirstChild("Wave")
-        RSTimer = state:FindFirstChild("Timer")
+function FileManager.Init()
+    if not isfolder(CONFIG.MacroFolder) then
+        makefolder(CONFIG.MacroFolder)
     end
 end
 
-local function FindTroopsFolder()
-    if TroopsFolder and TroopsFolder.Parent then return TroopsFolder end
-    for _, obj in ipairs(workspace:GetChildren()) do
-        if obj:IsA("Folder") or obj:IsA("Model") then
-            local t = obj:FindFirstChild("Troops")
-            if t then
-                TroopsFolder = t
-                return t
-            end
-        end
+function FileManager.GetPath(name)
+    -- Добавляем .lua если нет расширения
+    if not name:match("%.%w+$") then
+        name = name .. ".lua"
+    end
+    return CONFIG.MacroFolder .. "/" .. name
+end
+
+function FileManager.Write(name, content)
+    writefile(FileManager.GetPath(name), content)
+end
+
+function FileManager.Append(name, line)
+    appendfile(FileManager.GetPath(name), line .. "\n")
+end
+
+function FileManager.Read(name)
+    local path = FileManager.GetPath(name)
+    if isfile(path) then
+        return readfile(path)
     end
     return nil
 end
 
--------------------------------------------------
---  ПОЛУЧЕНИЕ ВОЛНЫ (GUI → fallback IntValue)
--------------------------------------------------
-local function GetWave()
-    local result = 0
-
-    local ok, guiWave = pcall(function()
-        local gui = LocalPlayer.PlayerGui:FindFirstChild("ReactGameTopGameDisplay")
-        if not gui then return nil end
-        local frame = gui:FindFirstChild("Frame")
-        if not frame then return nil end
-        local wave = frame:FindFirstChild("wave")
-        if not wave then return nil end
-        local container = wave:FindFirstChild("container")
-        if not container then return nil end
-        local val = container:FindFirstChild("value")
-        if val and val:IsA("TextLabel") then
-            return tonumber(val.Text)
-        end
-        return nil
-    end)
-
-    if ok and guiWave then
-        return guiWave
-    end
-
-    EnsureState()
-    if RSWave then
-        local v = RSWave.Value
-        if typeof(v) == "number" then return math.floor(v) end
-    end
-
-    return result
+function FileManager.Exists(name)
+    return isfile(FileManager.GetPath(name))
 end
 
--------------------------------------------------
---  ПОЛУЧЕНИЕ ТАЙМЕРА
--------------------------------------------------
-local function GetTimerSeconds()
-    EnsureState()
-    if RSTimer then
-        local v = RSTimer.Value
+function FileManager.Delete(name)
+    local path = FileManager.GetPath(name)
+    if isfile(path) then
+        delfile(path)
+        return true
+    end
+    return false
+end
+
+function FileManager.List()
+    local files = {}
+    if not isfolder(CONFIG.MacroFolder) then return files end
+    
+    for _, fullPath in ipairs(listfiles(CONFIG.MacroFolder)) do
+        local name = fullPath:match("[/\\]([^/\\]+)$")
+        if name then
+            table.insert(files, name)
+        end
+    end
+    
+    table.sort(files)
+    return files
+end
+
+FileManager.Init()
+
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 5: ИГРОВЫЕ ССЫЛКИ И УТИЛИТЫ
+-- ═══════════════════════════════════════════════
+
+--[[
+    GameBridge — мост между скриптом и игрой.
+    Обеспечивает доступ к RemoteFunction, State, Troops.
+    
+    Структура игры (TDS: Reanimated):
+    - ReplicatedStorage
+      ├── RemoteFunctions
+      │   └── Troops (RemoteFunction) — основной RF для действий с башнями
+      ├── State
+      │   ├── Wave (IntValue) — текущая волна
+      │   └── Timer (NumberValue) — таймер волны
+      └── Client
+          └── Modules
+              └── Game
+                  └── Interface
+                      └── Elements
+                          └── Upgrade
+                              ├── upgradeHandler (ModuleScript)
+                              └── upgradeGui (ModuleScript)
+    
+    - Workspace
+      └── <MapName>
+          └── Troops (Folder) — размещённые башни
+    
+    Формат вызова RemoteFunction:
+      RF:InvokeServer("Troops", Action, Arg3, Arg4)
+      
+    Действия (Action):
+      "Place"   — args[3]=TowerName, args[4]=CFrame
+      "Upgrade" — args[4]={Troop=Instance}
+      "Sell"    — args[4]={Troop=Instance}
+      "Target"  — args[4]={Troop=Instance, Priority=string}
+]]
+
+local GameBridge = {
+    RemoteFunction = nil,    -- RemoteFunction "Troops"
+    StateWave      = nil,    -- IntValue волны
+    StateTimer     = nil,    -- NumberValue таймера
+    UpgradeHandler = nil,    -- upgradeHandler модуль (для синхронизации GUI)
+    TroopsFolder   = nil,    -- Folder с башнями в workspace
+    _initialized   = false,
+}
+
+-- Получение RemoteFunction
+function GameBridge.GetRF()
+    if GameBridge.RemoteFunction then
+        return GameBridge.RemoteFunction
+    end
+    
+    local remoteFunctions = ReplicatedStorage:FindFirstChild("RemoteFunctions")
+    if not remoteFunctions then
+        remoteFunctions = ReplicatedStorage:WaitForChild("RemoteFunctions", 15)
+    end
+    
+    if remoteFunctions then
+        GameBridge.RemoteFunction = remoteFunctions:FindFirstChild("Troops")
+        if not GameBridge.RemoteFunction then
+            GameBridge.RemoteFunction = remoteFunctions:WaitForChild("Troops", 10)
+        end
+    end
+    
+    if not GameBridge.RemoteFunction then
+        warn("[GameBridge] RemoteFunction 'Troops' не найдена!")
+    end
+    
+    return GameBridge.RemoteFunction
+end
+
+-- Получение State (Wave, Timer)
+function GameBridge.GetState()
+    if GameBridge.StateWave then return end
+    
+    local state = ReplicatedStorage:FindFirstChild("State")
+    if not state then
+        state = ReplicatedStorage:WaitForChild("State", 15)
+    end
+    
+    if state then
+        GameBridge.StateWave  = state:FindFirstChild("Wave")
+        GameBridge.StateTimer = state:FindFirstChild("Timer")
+    end
+end
+
+-- Получение upgradeHandler для синхронизации GUI
+function GameBridge.GetUpgradeHandler()
+    if GameBridge.UpgradeHandler then
+        return GameBridge.UpgradeHandler
+    end
+    
+    local ok, handler = pcall(function()
+        return require(
+            ReplicatedStorage
+                .Client.Modules.Game.Interface
+                .Elements.Upgrade.upgradeHandler
+        )
+    end)
+    
+    if ok and handler then
+        GameBridge.UpgradeHandler = handler
+    end
+    
+    return GameBridge.UpgradeHandler
+end
+
+--[[
+    SyncGUI — синхронизирует GUI после Place/Upgrade.
+    
+    Проблема: upgradeGui:398 "attempt to index nil with 'Clone'"
+    Причина: hookmetamethod оборачивает InvokeServer в корутину,
+             GUI-модуль upgradeGui ожидает синхронный результат
+             и пытается обновить интерфейс, но контекст уже другой.
+    Решение: вызываем upgradeHandler:selectTroop(troop) после действия,
+             что инициализирует GUI корректно.
+]]
+function GameBridge.SyncGUI(troop)
+    if not troop then return end
+    
+    local handler = GameBridge.GetUpgradeHandler()
+    if handler then
+        pcall(function()
+            handler:selectTroop(troop)
+        end)
+    end
+end
+
+-- Поиск папки Troops в workspace (внутри карты)
+function GameBridge.FindTroopsFolder()
+    if GameBridge.TroopsFolder and GameBridge.TroopsFolder.Parent then
+        return GameBridge.TroopsFolder
+    end
+    
+    -- Ищем во всех дочерних объектах workspace
+    for _, child in ipairs(workspace:GetChildren()) do
+        if child:IsA("Model") or child:IsA("Folder") then
+            local troops = child:FindFirstChild("Troops")
+            if troops then
+                GameBridge.TroopsFolder = troops
+                return troops
+            end
+        end
+    end
+    
+    return nil
+end
+
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 6: СИСТЕМА ТАЙМЕРОВ И ВОЛН
+-- ═══════════════════════════════════════════════
+
+--[[
+    WaveTimer — отслеживает текущую волну и время.
+    
+    Волна берётся из двух источников (по приоритету):
+    1. GUI: PlayerGui.ReactGameTopGameDisplay.Frame.wave.container.value (TextLabel)
+    2. State: ReplicatedStorage.State.Wave (IntValue)
+    
+    GUI обновляется клиентским скриптом и может отличаться
+    от IntValue по таймингу. Приоритет GUI — как в оригинале Strategies-X.
+]]
+local WaveTimer = {}
+
+-- Получение текущей волны
+function WaveTimer.GetWave()
+    -- Источник 1: GUI (приоритет)
+    local guiOk, guiWave = pcall(function()
+        local display = PlayerGui:FindFirstChild("ReactGameTopGameDisplay")
+        if not display then return nil end
+        
+        local frame = display:FindFirstChild("Frame")
+        if not frame then return nil end
+        
+        local waveFrame = frame:FindFirstChild("wave")
+        if not waveFrame then return nil end
+        
+        local container = waveFrame:FindFirstChild("container")
+        if not container then return nil end
+        
+        local valueLabel = container:FindFirstChild("value")
+        if valueLabel and valueLabel:IsA("TextLabel") then
+            return tonumber(valueLabel.Text)
+        end
+        
+        return nil
+    end)
+    
+    if guiOk and guiWave and guiWave > 0 then
+        return guiWave
+    end
+    
+    -- Источник 2: IntValue (fallback)
+    GameBridge.GetState()
+    if GameBridge.StateWave then
+        local v = GameBridge.StateWave.Value
+        if typeof(v) == "number" then
+            return math.floor(v)
+        end
+    end
+    
+    return 0
+end
+
+-- Получение таймера в секундах
+function WaveTimer.GetSeconds()
+    GameBridge.GetState()
+    if GameBridge.StateTimer then
+        local v = GameBridge.StateTimer.Value
         if typeof(v) == "number" then return v end
         if typeof(v) == "string" then return tonumber(v) or 0 end
     end
     return 0
 end
 
-local function GetTimer()
-    local wave = GetWave()
-    local raw  = GetTimerSeconds()
-    local mins = math.floor(raw / 60)
-    local secs = raw - mins * 60
-
-    local timerCheck = true
+-- Проверка: идёт ли подготовка (true) или волна (false)
+function WaveTimer.IsIntermission()
+    local result = true
+    
     pcall(function()
         local state = ReplicatedStorage:FindFirstChild("State")
-        if state then
-            local tc = state:FindFirstChild("TimerCheck")
-                    or state:FindFirstChild("Intermission")
-                    or state:FindFirstChild("Preparing")
-            if tc then
-                timerCheck = tc.Value and true or false
-            end
+        if not state then return end
+        
+        -- Ищем различные возможные названия
+        local check = state:FindFirstChild("TimerCheck")
+                   or state:FindFirstChild("Intermission")
+                   or state:FindFirstChild("Preparing")
+                   or state:FindFirstChild("IsIntermission")
+        
+        if check then
+            result = (check.Value == true)
         end
     end)
-
-    return {wave, mins, secs, tostring(timerCheck)}
+    
+    return result
 end
 
--------------------------------------------------
---  upgradeHandler для синхронизации GUI
--------------------------------------------------
-local upgradeHandler = nil
-pcall(function()
-    upgradeHandler = require(
-        ReplicatedStorage.Client.Modules.Game.Interface.Elements.Upgrade.upgradeHandler
+--[[
+    GetTimerData — возвращает полные данные таймера для записи.
+    Формат: {wave, minutes, seconds, timerCheck}
+    
+    wave       — номер текущей волны
+    minutes    — полные минуты таймера
+    seconds    — оставшиеся секунды
+    timerCheck — "true" если подготовка, "false" если волна
+]]
+function WaveTimer.GetTimerData()
+    local wave    = WaveTimer.GetWave()
+    local rawSecs = WaveTimer.GetSeconds()
+    local mins    = math.floor(rawSecs / 60)
+    local secs    = rawSecs - (mins * 60)
+    local tc      = tostring(WaveTimer.IsIntermission())
+    
+    return {wave, mins, secs, tc}
+end
+
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 7: RECORDER — ЗАПИСЬ МАКРОСА
+-- ═══════════════════════════════════════════════
+
+--[[
+    Recorder — перехватывает вызовы InvokeServer к RemoteFunction "Troops"
+    и записывает действия игрока в файл.
+    
+    Формат записи:
+      TDS:Place("TowerName", x, y, z, wave, min, sec, "tc", rx, ry, rz)
+      TDS:Upgrade(id, wave, min, sec, "tc")
+      TDS:Sell(id, wave, min, sec, "tc")
+      TDS:Target(id, "priority", wave, min, sec, "tc")
+    
+    Как работает перехват:
+    - hookmetamethod перехватывает __namecall
+    - Фильтрует только InvokeServer к GameRF (Troops)
+    - Оборачивает в корутину для получения результата
+    - Записывает действие в файл
+    - Вызывает SyncGUI для предотвращения ошибки Clone
+]]
+local Recorder = {
+    Active     = false,
+    FileName   = "",
+    TowerCount = 0,
+    Towers     = {},     -- [id] = {Name, Instance}
+    _hooked    = false,  -- hook создаётся один раз
+}
+
+-- Форматирование таймера для записи
+-- Формат: wave, min, sec, "tc"  (tc всегда в кавычках!)
+local function FormatTimer(timerData)
+    return string.format(
+        '%d, %d, %.4f, "%s"',
+        timerData[1], timerData[2], timerData[3], timerData[4]
     )
-end)
-
-local function SyncGUI(troop)
-    if upgradeHandler and troop then
-        pcall(function()
-            upgradeHandler:selectTroop(troop)
-        end)
-    end
 end
 
--------------------------------------------------
---  ЗАПИСЬ (RECORDER)
--------------------------------------------------
-local Recorder = {}
-Recorder.Active     = false
-Recorder.FileName   = ""
-Recorder.TowerCount = 0
-Recorder.Towers     = {}
-Recorder.Hooked     = false
+-- ═════ Генераторы записей для каждого действия ═════
 
-local Gen = {}
+local ActionGenerators = {}
 
-Gen.Place = function(args, timer, result)
+--[[
+    Place — размещение башни.
+    args[3] = имя башни (string)
+    args[4] = CFrame позиции
+    result  = Instance (размещённая башня) или nil при ошибке
+]]
+ActionGenerators.Place = function(args, timerData, result)
+    -- Проверяем что сервер вернул Instance
     if typeof(result) ~= "Instance" then
-        warn("[Recorder] Place: RF вернул не Instance — пропуск")
+        warn("[Recorder] Place: сервер вернул не Instance, тип: " .. typeof(result))
         return
     end
-
+    
     local towerName = args[3]
-    local cframe    = args[4]
-    if typeof(cframe) ~= "CFrame" then
-        warn("[Recorder] Place: args[4] не CFrame — пропуск")
+    if typeof(towerName) ~= "string" then
+        warn("[Recorder] Place: args[3] не строка")
         return
     end
-
-    local pos = cframe.Position
-    local rx, ry, rz = cframe:ToEulerAnglesYXZ()
-
+    
+    local cframe = args[4]
+    if typeof(cframe) ~= "CFrame" then
+        warn("[Recorder] Place: args[4] не CFrame")
+        return
+    end
+    
+    -- Увеличиваем счётчик и присваиваем ID
     Recorder.TowerCount = Recorder.TowerCount + 1
     local id = Recorder.TowerCount
+    
+    -- Переименовываем Instance для отслеживания
     result.Name = tostring(id)
-
+    
+    -- Сохраняем в таблицу
     Recorder.Towers[id] = {
-        TowerName = towerName,
-        Instance  = result,
+        Name     = towerName,
+        Instance = result,
     }
-
-    SyncGUI(result)
-
-    local ts = string.format('%d, %d, %.4f, "%s"', timer[1], timer[2], timer[3], timer[4])
-    FileAppend(Recorder.FileName, string.format(
+    
+    -- ★ Синхронизация GUI (FIX ошибки Clone)
+    GameBridge.SyncGUI(result)
+    
+    -- Извлекаем позицию и вращение
+    local pos = cframe.Position
+    local rx, ry, rz = cframe:ToEulerAnglesYXZ()
+    
+    -- Записываем в файл
+    local timerStr = FormatTimer(timerData)
+    FileManager.Append(Recorder.FileName, string.format(
         'TDS:Place("%s", %.4f, %.4f, %.4f, %s, %.6f, %.6f, %.6f)',
-        towerName, pos.X, pos.Y, pos.Z, ts, rx, ry, rz
+        towerName, pos.X, pos.Y, pos.Z, timerStr, rx, ry, rz
     ))
-
-    print(string.format("[Recorder] Place %-14s ID:%-3d Wave:%d", towerName, id, timer[1]))
+    
+    print(string.format("[Recorder] Place %-14s ID:%-3d Wave:%d", towerName, id, timerData[1]))
 end
 
-Gen.Upgrade = function(args, timer, result)
-    local troopData = args[4]
-    if typeof(troopData) ~= "table" then
-        warn("[Recorder] Upgrade: args[4] не таблица")
+--[[
+    Upgrade — улучшение башни.
+    args[4] = {Troop = Instance}
+    result  = true при успехе
+]]
+ActionGenerators.Upgrade = function(args, timerData, result)
+    local data = args[4]
+    if typeof(data) ~= "table" or not data.Troop then
+        warn("[Recorder] Upgrade: args[4] не содержит Troop")
         return
     end
-
-    local troop = troopData.Troop
-    if not troop or typeof(troop) ~= "Instance" then
-        warn("[Recorder] Upgrade: нет Troop Instance")
+    
+    local troop = data.Troop
+    if typeof(troop) ~= "Instance" then
+        warn("[Recorder] Upgrade: Troop не Instance")
         return
     end
-
+    
     local id = tonumber(troop.Name)
     if not id then
-        warn("[Recorder] Upgrade: имя трупа не число: " .. tostring(troop.Name))
+        warn("[Recorder] Upgrade: имя башни не число: " .. tostring(troop.Name))
         return
     end
-
+    
     if result ~= true then
-        warn("[Recorder] Upgrade FAILED ID:" .. id)
+        warn("[Recorder] Upgrade FAILED для ID:" .. id)
         return
     end
-
-    SyncGUI(troop)
-
-    local ts = string.format('%d, %d, %.4f, "%s"', timer[1], timer[2], timer[3], timer[4])
-    FileAppend(Recorder.FileName, string.format('TDS:Upgrade(%d, %s)', id, ts))
-    print(string.format("[Recorder] Upgrade ID:%-3d Wave:%d", id, timer[1]))
+    
+    -- ★ Синхронизация GUI
+    GameBridge.SyncGUI(troop)
+    
+    local timerStr = FormatTimer(timerData)
+    FileManager.Append(Recorder.FileName, string.format(
+        'TDS:Upgrade(%d, %s)', id, timerStr
+    ))
+    
+    print(string.format("[Recorder] Upgrade ID:%-3d Wave:%d", id, timerData[1]))
 end
 
-Gen.Sell = function(args, timer, result)
-    local troopData = args[4]
-    if typeof(troopData) ~= "table" then return end
-    local troop = troopData.Troop
-    if not troop or typeof(troop) ~= "Instance" then return end
+--[[
+    Sell — продажа башни.
+    args[4] = {Troop = Instance}
+]]
+ActionGenerators.Sell = function(args, timerData, result)
+    local data = args[4]
+    if typeof(data) ~= "table" or not data.Troop then return end
+    
+    local troop = data.Troop
+    if typeof(troop) ~= "Instance" then return end
+    
     local id = tonumber(troop.Name)
     if not id then return end
-
-    local ts = string.format('%d, %d, %.4f, "%s"', timer[1], timer[2], timer[3], timer[4])
-    FileAppend(Recorder.FileName, string.format('TDS:Sell(%d, %s)', id, ts))
-    print(string.format("[Recorder] Sell   ID:%-3d Wave:%d", id, timer[1]))
+    
+    local timerStr = FormatTimer(timerData)
+    FileManager.Append(Recorder.FileName, string.format(
+        'TDS:Sell(%d, %s)', id, timerStr
+    ))
+    
+    print(string.format("[Recorder] Sell   ID:%-3d Wave:%d", id, timerData[1]))
 end
 
-Gen.Target = function(args, timer, result)
-    local troopData = args[4]
-    if typeof(troopData) ~= "table" then return end
-    local troop = troopData.Troop
-    if not troop or typeof(troop) ~= "Instance" then return end
+--[[
+    Target — изменение приоритета цели.
+    args[4] = {Troop = Instance, Priority = string}
+]]
+ActionGenerators.Target = function(args, timerData, result)
+    local data = args[4]
+    if typeof(data) ~= "table" or not data.Troop then return end
+    
+    local troop = data.Troop
+    if typeof(troop) ~= "Instance" then return end
+    
     local id = tonumber(troop.Name)
     if not id then return end
-
-    local priority = troopData.Priority or troopData.Setting or "Unknown"
-
-    local ts = string.format('%d, %d, %.4f, "%s"', timer[1], timer[2], timer[3], timer[4])
-    FileAppend(Recorder.FileName, string.format('TDS:Target(%d, "%s", %s)', id, tostring(priority), ts))
-    print(string.format("[Recorder] Target ID:%-3d → %s Wave:%d", id, tostring(priority), timer[1]))
+    
+    local priority = data.Priority or data.Setting or "First"
+    
+    local timerStr = FormatTimer(timerData)
+    FileManager.Append(Recorder.FileName, string.format(
+        'TDS:Target(%d, "%s", %s)', id, tostring(priority), timerStr
+    ))
+    
+    print(string.format("[Recorder] Target ID:%-3d → %s Wave:%d", id, tostring(priority), timerData[1]))
 end
 
-local CoroutineActions = {
-    Place        = Gen.Place,
-    Upgrade      = Gen.Upgrade,
-    Sell         = Gen.Sell,
-    Target       = Gen.Target,
-    SetTarget    = Gen.Target,
-    ChangeTarget = Gen.Target,
+-- Маппинг действий (включая альтернативные названия)
+local ActionMap = {
+    Place        = ActionGenerators.Place,
+    Upgrade      = ActionGenerators.Upgrade,
+    Sell         = ActionGenerators.Sell,
+    Target       = ActionGenerators.Target,
+    SetTarget    = ActionGenerators.Target,
+    ChangeTarget = ActionGenerators.Target,
 }
+
+-- ═════ Управление записью ═════
 
 function Recorder:Start(fileName)
     if self.Active then
-        warn("[Recorder] Уже записывается!")
-        return false
+        warn("[Recorder] Уже идёт запись!")
+        return false, "Запись уже идёт"
     end
-
+    
+    -- Проверяем доступность RF
+    local rf = GameBridge.GetRF()
+    if not rf then
+        return false, "RemoteFunction не найдена"
+    end
+    
+    -- Инициализация
     self.FileName   = fileName
     self.TowerCount = 0
     self.Towers     = {}
     self.Active     = true
-
-    FileWrite(fileName, "-- TDS Macro v" .. VERSION .. "\n")
-    FileAppend(fileName, "-- Recorded: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n\n")
-
-    EnsureRemote()
-
-    if not self.Hooked then
-        self.Hooked = true
-
-        local oldHook
-        oldHook = hookmetamethod(game, "__namecall", newcclosure(function(self2, ...)
-            local method = getnamecallmethod()
-
-            if method ~= "InvokeServer" then
-                return oldHook(self2, ...)
-            end
-
-            if self2 ~= GameRF then
-                return oldHook(self2, ...)
-            end
-
-            if not Recorder.Active then
-                return oldHook(self2, ...)
-            end
-
-            local args = {...}
-            local category = args[1]
-            local action   = args[2]
-
-            if category ~= "Troops" then
-                return oldHook(self2, ...)
-            end
-
-            local handler = CoroutineActions[action]
-            if not handler then
-                return oldHook(self2, ...)
-            end
-
-            local thread = coroutine.running()
-            coroutine.wrap(function(a)
-                local timer  = GetTimer()
-                local result = oldHook(self2, table.unpack(a))
-
-                pcall(function()
-                    handler(a, timer, result)
-                end)
-
-                coroutine.resume(thread, result)
-            end)({...})
-
-            return coroutine.yield()
-        end))
+    
+    -- Создаём файл с заголовком
+    FileManager.Write(fileName,
+        "-- TDS: Reanimated Macro v" .. CONFIG.Version .. "\n" ..
+        "-- Recorded: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n" ..
+        "-- Player: " .. LocalPlayer.Name .. "\n\n"
+    )
+    
+    -- Устанавливаем hook (один раз за сессию)
+    if not self._hooked then
+        self._hooked = true
+        self:_installHook()
     end
-
+    
     print("[Recorder] ▶ Запись начата → " .. fileName)
-    return true
+    return true, "Запись начата"
 end
 
 function Recorder:Stop()
     if not self.Active then return end
+    
     self.Active = false
-    FileAppend(self.FileName, "\n-- End of macro")
-    print("[Recorder] ■ Запись остановлена. Towers: " .. self.TowerCount)
+    FileManager.Append(self.FileName, "\n-- End of macro | Towers: " .. self.TowerCount)
+    
+    print("[Recorder] ■ Запись остановлена | Башен: " .. self.TowerCount)
 end
 
--------------------------------------------------
---  ВОСПРОИЗВЕДЕНИЕ (PLAYBACK)
--------------------------------------------------
-local Playback = {}
-Playback.Active     = false
-Playback.Paused     = false
-Playback.Towers     = {}
-Playback.TowerCount = 0
-
-local function WaitForWave(targetWave)
-    local t0 = tick()
-    while Playback.Active do
-        local cur = GetWave()
-        if cur >= targetWave then return true end
-        if tick() - t0 > TIMEOUT_WAVE then
-            warn("[Playback] Таймаут ожидания волны " .. targetWave .. " (текущая " .. cur .. ")")
-            return false
+--[[
+    _installHook — устанавливает перехват __namecall.
+    
+    Как это работает:
+    1. hookmetamethod заменяет метод __namecall у всех объектов game
+    2. Фильтруем: только InvokeServer, только наш RF, только при активной записи
+    3. Оборачиваем в корутину:
+       - Получаем timerData ДО вызова (фиксируем момент действия)
+       - Вызываем оригинальный InvokeServer
+       - Получаем результат
+       - Записываем действие
+       - Возвращаем результат игровому коду
+    4. SyncGUI предотвращает ошибку upgradeGui Clone
+]]
+function Recorder:_installHook()
+    local rf = GameBridge.GetRF()
+    if not rf then
+        warn("[Recorder] Не удалось установить hook: RF не найдена")
+        return
+    end
+    
+    local originalNamecall
+    originalNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self2, ...)
+        local method = getnamecallmethod()
+        
+        -- Фильтр 1: только InvokeServer
+        if method ~= "InvokeServer" then
+            return originalNamecall(self2, ...)
         end
-        while Playback.Paused and Playback.Active do
+        
+        -- Фильтр 2: только наш RemoteFunction
+        if self2 ~= rf then
+            return originalNamecall(self2, ...)
+        end
+        
+        -- Фильтр 3: только при активной записи
+        if not Recorder.Active then
+            return originalNamecall(self2, ...)
+        end
+        
+        local packedArgs = {...}
+        local category   = packedArgs[1]  -- "Troops"
+        local action     = packedArgs[2]  -- "Place"/"Upgrade"/etc.
+        
+        -- Фильтр 4: только категория "Troops"
+        if category ~= "Troops" then
+            return originalNamecall(self2, ...)
+        end
+        
+        -- Фильтр 5: только известные действия
+        local handler = ActionMap[action]
+        if not handler then
+            return originalNamecall(self2, ...)
+        end
+        
+        -- ═══ Корутинный перехват ═══
+        -- Сохраняем текущий поток, чтобы вернуть результат
+        local callerThread = coroutine.running()
+        
+        coroutine.wrap(function(capturedArgs)
+            -- Фиксируем таймер ДО вызова сервера
+            local timerData = WaveTimer.GetTimerData()
+            
+            -- Вызываем оригинальный InvokeServer
+            local result = originalNamecall(self2, table.unpack(capturedArgs))
+            
+            -- Записываем действие (безопасно)
+            local recordOk, recordErr = pcall(function()
+                handler(capturedArgs, timerData, result)
+            end)
+            
+            if not recordOk then
+                warn("[Recorder] Ошибка записи " .. action .. ": " .. tostring(recordErr))
+            end
+            
+            -- Возвращаем результат вызывающему коду
+            coroutine.resume(callerThread, result)
+        end)({...})
+        
+        -- Ждём результат из корутины
+        return coroutine.yield()
+    end))
+    
+    print("[Recorder] Hook установлен на __namecall")
+end
+
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 8: ПАРСЕР МАКРО-ФАЙЛОВ
+-- ═══════════════════════════════════════════════
+
+--[[
+    MacroParser — разбирает .lua файл макроса в список команд.
+    
+    Поддерживаемые форматы:
+      TDS:Place("Name", x, y, z, wave, min, sec, "tc", rx, ry, rz)
+      TDS:Place("Name", x, y, z, wave, min, sec, tc, rx, ry, rz)  -- tc без кавычек тоже работает
+      TDS:Upgrade(id, wave, min, sec, "tc")
+      TDS:Sell(id, wave, min, sec, "tc")
+      TDS:Target(id, "priority", wave, min, sec, "tc")
+    
+    Паттерн для tc: "?([^",%)]+)"?
+    Это позволяет матчить и "true" и true
+]]
+local MacroParser = {}
+
+-- Числовой паттерн (включая научную нотацию и отрицательные)
+local NUM = "([-%.%deE]+)"
+-- Паттерн для timerCheck (с кавычками и без)
+local TC  = '"?([^",%)]+)"?'
+
+function MacroParser.Parse(content)
+    local commands = {}
+    local lineNum  = 0
+    
+    for line in content:gmatch("[^\r\n]+") do
+        lineNum = lineNum + 1
+        local trimmed = line:match("^%s*(.-)%s*$")
+        
+        -- Пропуск пустых строк и комментариев
+        if trimmed == "" or trimmed:sub(1, 2) == "--" then
+            -- skip
+            
+        elseif trimmed:find("^TDS:Place") then
+            -- Place: TDS:Place("Name", x, y, z, wave, min, sec, "tc", rx, ry, rz)
+            local nm, x, y, z, wv, mn, sc, tc, rx, ry, rz = trimmed:match(
+                'TDS:Place%(' ..
+                '"([^"]+)",%s*' ..                           -- towerName
+                NUM .. ',%s*' .. NUM .. ',%s*' .. NUM .. ',%s*' ..  -- x, y, z
+                '(%d+),%s*(%d+),%s*' .. NUM .. ',%s*' ..     -- wave, min, sec
+                TC .. ',%s*' ..                               -- timerCheck
+                NUM .. ',%s*' .. NUM .. ',%s*' .. NUM ..      -- rx, ry, rz
+                '%)'
+            )
+            
+            if nm then
+                table.insert(commands, {
+                    Type  = "Place",
+                    Args  = {
+                        nm,
+                        tonumber(x), tonumber(y), tonumber(z),
+                        tonumber(wv), tonumber(mn), tonumber(sc),
+                        tc,
+                        tonumber(rx), tonumber(ry), tonumber(rz),
+                    },
+                    Wave  = tonumber(wv),
+                    Line  = lineNum,
+                })
+            else
+                warn("[Parser] Строка " .. lineNum .. ": Place не распознан: " .. trimmed)
+            end
+            
+        elseif trimmed:find("^TDS:Upgrade") then
+            -- Upgrade: TDS:Upgrade(id, wave, min, sec, "tc")
+            local id, wv, mn, sc, tc = trimmed:match(
+                'TDS:Upgrade%(' ..
+                '(%d+),%s*' ..
+                '(%d+),%s*(%d+),%s*' .. NUM .. ',%s*' ..
+                TC ..
+                '%)'
+            )
+            
+            if id then
+                table.insert(commands, {
+                    Type = "Upgrade",
+                    Args = {tonumber(id), tonumber(wv), tonumber(mn), tonumber(sc), tc},
+                    Wave = tonumber(wv),
+                    Line = lineNum,
+                })
+            else
+                warn("[Parser] Строка " .. lineNum .. ": Upgrade не распознан: " .. trimmed)
+            end
+            
+        elseif trimmed:find("^TDS:Sell") then
+            -- Sell: TDS:Sell(id, wave, min, sec, "tc")
+            local id, wv, mn, sc, tc = trimmed:match(
+                'TDS:Sell%(' ..
+                '(%d+),%s*' ..
+                '(%d+),%s*(%d+),%s*' .. NUM .. ',%s*' ..
+                TC ..
+                '%)'
+            )
+            
+            if id then
+                table.insert(commands, {
+                    Type = "Sell",
+                    Args = {tonumber(id), tonumber(wv), tonumber(mn), tonumber(sc), tc},
+                    Wave = tonumber(wv),
+                    Line = lineNum,
+                })
+            else
+                warn("[Parser] Строка " .. lineNum .. ": Sell не распознан: " .. trimmed)
+            end
+            
+        elseif trimmed:find("^TDS:Target") then
+            -- Target: TDS:Target(id, "priority", wave, min, sec, "tc")
+            local id, pr, wv, mn, sc, tc = trimmed:match(
+                'TDS:Target%(' ..
+                '(%d+),%s*' ..
+                '"([^"]*)",%s*' ..
+                '(%d+),%s*(%d+),%s*' .. NUM .. ',%s*' ..
+                TC ..
+                '%)'
+            )
+            
+            if id then
+                table.insert(commands, {
+                    Type = "Target",
+                    Args = {tonumber(id), pr, tonumber(wv), tonumber(mn), tonumber(sc), tc},
+                    Wave = tonumber(wv),
+                    Line = lineNum,
+                })
+            else
+                warn("[Parser] Строка " .. lineNum .. ": Target не распознан: " .. trimmed)
+            end
+            
+        else
+            warn("[Parser] Строка " .. lineNum .. ": нераспознано: " .. trimmed)
+        end
+    end
+    
+    print("[Parser] Распознано команд: " .. #commands)
+    return commands
+end
+
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 9: PLAYBACK — ВОСПРОИЗВЕДЕНИЕ МАКРОСА
+-- ═══════════════════════════════════════════════
+
+--[[
+    Playback — воспроизводит записанный макрос.
+    
+    Как работает:
+    1. Парсит файл в список команд
+    2. Последовательно выполняет каждую команду
+    3. Перед каждым действием ждёт нужную волну
+    4. Place создаёт башню и сохраняет Instance по ID
+    5. Upgrade/Sell/Target ждут появления башни по ID
+    
+    Проблема из оригинального бага:
+    "Башня ID:1 не найдена за 45 секунд"
+    
+    Причина: tc записывался без кавычек (true вместо "true"),
+    парсер не мог распарсить строку Place → TowersContained пуст →
+    все Upgrade/Sell ждали несуществующую башню.
+    
+    Решение: FormatTimer всегда оборачивает tc в кавычки,
+    парсер принимает оба варианта через паттерн "?([^",%)]+)"?
+]]
+local Playback = {
+    Active     = false,
+    Paused     = false,
+    Towers     = {},      -- [id] = Instance
+    TowerCount = 0,
+    Progress   = 0,       -- текущая команда
+    Total      = 0,       -- всего команд
+    StatusCallback = nil,  -- callback для обновления UI
+}
+
+-- Обновление статуса в UI
+function Playback:_setStatus(text)
+    if self.StatusCallback then
+        pcall(function()
+            self.StatusCallback(text)
+        end)
+    end
+    print("[Playback] " .. text)
+end
+
+-- Ожидание нужной волны
+function Playback:_waitForWave(targetWave)
+    local startTime = tick()
+    
+    while self.Active do
+        -- Проверка паузы
+        while self.Paused and self.Active do
             task.wait(0.25)
         end
-        task.wait(POLL_INTERVAL)
+        
+        if not self.Active then return false end
+        
+        local currentWave = WaveTimer.GetWave()
+        if currentWave >= targetWave then
+            return true
+        end
+        
+        -- Таймаут
+        if tick() - startTime > CONFIG.TimeoutWave then
+            warn("[Playback] Таймаут ожидания волны " .. targetWave ..
+                 " (текущая: " .. currentWave .. ")")
+            return false
+        end
+        
+        task.wait(CONFIG.PollInterval)
     end
+    
     return false
 end
 
-local function TimeWaveWait(wave, min, sec, tc)
-    if not WaitForWave(wave) then return false end
-    return true
-end
-
-local function WaitForTower(id)
-    if Playback.Towers[id] then return Playback.Towers[id] end
-    local t0 = tick()
-    while Playback.Active do
-        if Playback.Towers[id] then return Playback.Towers[id] end
-        if tick() - t0 > TIMEOUT_TOWER then
-            warn("[Playback] Башня ID:" .. id .. " не найдена за " .. TIMEOUT_TOWER .. " секунд")
+-- Ожидание башни по ID
+function Playback:_waitForTower(id)
+    if self.Towers[id] then
+        return self.Towers[id]
+    end
+    
+    local startTime = tick()
+    
+    while self.Active do
+        if self.Towers[id] then
+            return self.Towers[id]
+        end
+        
+        if tick() - startTime > CONFIG.TimeoutTower then
+            warn("[Playback] Башня ID:" .. id .. " не найдена за " ..
+                 CONFIG.TimeoutTower .. " секунд")
             return nil
         end
-        task.wait(POLL_INTERVAL)
+        
+        task.wait(CONFIG.PollInterval)
     end
+    
     return nil
 end
 
-local TDS = {}
+-- ═════ Действия воспроизведения ═════
 
-function TDS.Place(towerName, x, y, z, wave, min, sec, tc, rx, ry, rz)
+local PlaybackActions = {}
+
+function PlaybackActions.Place(pb, towerName, x, y, z, wave, min, sec, tc, rx, ry, rz)
     rx = rx or 0
     ry = ry or 0
     rz = rz or 0
-
-    if not TimeWaveWait(wave, min, sec, tc) then return end
-
-    EnsureRemote()
-    if not GameRF then
-        warn("[Playback] GameRF недоступен")
+    
+    pb:_setStatus(string.format("Ожидание волны %d для Place '%s'...", wave, towerName))
+    
+    if not pb:_waitForWave(wave) then return end
+    
+    local rf = GameBridge.GetRF()
+    if not rf then
+        warn("[Playback] RF недоступен для Place")
         return
     end
-
+    
     local cf = CFrame.new(x, y, z) * CFrame.fromEulerAnglesYXZ(rx, ry, rz)
-
-    print(string.format("[Playback] Place %-14s at (%.1f, %.1f, %.1f) Wave:%d", towerName, x, y, z, wave))
-
+    
+    pb:_setStatus(string.format("Place '%s' (%.0f, %.0f, %.0f)", towerName, x, y, z))
+    
     local ok, result = pcall(function()
-        return GameRF:InvokeServer("Troops", "Place", towerName, cf)
+        return rf:InvokeServer("Troops", "Place", towerName, cf)
     end)
-
+    
     if ok and typeof(result) == "Instance" then
-        Playback.TowerCount = Playback.TowerCount + 1
-        local id = Playback.TowerCount
+        pb.TowerCount = pb.TowerCount + 1
+        local id = pb.TowerCount
         result.Name = tostring(id)
-        Playback.Towers[id] = result
-        print(string.format("[Playback] ✓ Placed ID:%d", id))
-        SyncGUI(result)
+        pb.Towers[id] = result
+        
+        GameBridge.SyncGUI(result)
+        
+        pb:_setStatus(string.format("✓ Placed '%s' ID:%d", towerName, id))
     else
         warn("[Playback] ✗ Place failed: " .. tostring(result))
     end
 end
 
-function TDS.Upgrade(id, wave, min, sec, tc)
-    if not TimeWaveWait(wave, min, sec, tc) then return end
-
-    local troop = WaitForTower(id)
+function PlaybackActions.Upgrade(pb, id, wave, min, sec, tc)
+    pb:_setStatus(string.format("Ожидание волны %d для Upgrade ID:%d...", wave, id))
+    
+    if not pb:_waitForWave(wave) then return end
+    
+    local troop = pb:_waitForTower(id)
     if not troop then return end
-
-    EnsureRemote()
-    if not GameRF then return end
-
-    print(string.format("[Playback] Upgrade ID:%d Wave:%d", id, wave))
-
+    
+    local rf = GameBridge.GetRF()
+    if not rf then return end
+    
+    pb:_setStatus(string.format("Upgrade ID:%d", id))
+    
     local ok, result = pcall(function()
-        return GameRF:InvokeServer("Troops", "Upgrade", nil, {Troop = troop})
+        return rf:InvokeServer("Troops", "Upgrade", nil, {Troop = troop})
     end)
-
+    
     if ok and result == true then
-        print(string.format("[Playback] ✓ Upgraded ID:%d", id))
-        SyncGUI(troop)
+        GameBridge.SyncGUI(troop)
+        pb:_setStatus(string.format("✓ Upgraded ID:%d", id))
     else
-        warn("[Playback] ✗ Upgrade failed ID:" .. id .. ": " .. tostring(result))
+        warn("[Playback] ✗ Upgrade failed ID:" .. id .. " — " .. tostring(result))
     end
 end
 
-function TDS.Sell(id, wave, min, sec, tc)
-    if not TimeWaveWait(wave, min, sec, tc) then return end
-
-    local troop = WaitForTower(id)
+function PlaybackActions.Sell(pb, id, wave, min, sec, tc)
+    pb:_setStatus(string.format("Ожидание волны %d для Sell ID:%d...", wave, id))
+    
+    if not pb:_waitForWave(wave) then return end
+    
+    local troop = pb:_waitForTower(id)
     if not troop then return end
-
-    EnsureRemote()
-    if not GameRF then return end
-
-    print(string.format("[Playback] Sell ID:%d Wave:%d", id, wave))
-
+    
+    local rf = GameBridge.GetRF()
+    if not rf then return end
+    
+    pb:_setStatus(string.format("Sell ID:%d", id))
+    
     local ok, result = pcall(function()
-        return GameRF:InvokeServer("Troops", "Sell", nil, {Troop = troop})
+        return rf:InvokeServer("Troops", "Sell", nil, {Troop = troop})
     end)
-
+    
     if ok then
-        Playback.Towers[id] = nil
-        print(string.format("[Playback] ✓ Sold ID:%d", id))
+        pb.Towers[id] = nil
+        pb:_setStatus(string.format("✓ Sold ID:%d", id))
     else
         warn("[Playback] ✗ Sell failed ID:" .. id)
     end
 end
 
-function TDS.Target(id, priority, wave, min, sec, tc)
-    if not TimeWaveWait(wave, min, sec, tc) then return end
-
-    local troop = WaitForTower(id)
+function PlaybackActions.Target(pb, id, priority, wave, min, sec, tc)
+    pb:_setStatus(string.format("Ожидание волны %d для Target ID:%d...", wave, id))
+    
+    if not pb:_waitForWave(wave) then return end
+    
+    local troop = pb:_waitForTower(id)
     if not troop then return end
-
-    EnsureRemote()
-    if not GameRF then return end
-
-    print(string.format("[Playback] Target ID:%d → %s Wave:%d", id, priority, wave))
-
+    
+    local rf = GameBridge.GetRF()
+    if not rf then return end
+    
+    pb:_setStatus(string.format("Target ID:%d → %s", id, priority))
+    
     pcall(function()
-        GameRF:InvokeServer("Troops", "Target", nil, {Troop = troop, Priority = priority})
+        rf:InvokeServer("Troops", "Target", nil, {
+            Troop    = troop,
+            Priority = priority,
+        })
     end)
+    
+    pb:_setStatus(string.format("✓ Target ID:%d → %s", id, priority))
 end
 
--------------------------------------------------
---  ПАРСЕР МАКРО-ФАЙЛА
--------------------------------------------------
-local function ParseMacro(content)
-    local commands = {}
+-- ═════ Управление воспроизведением ═════
 
-    for line in content:gmatch("[^\r\n]+") do
-        local trimmed = line:match("^%s*(.-)%s*$")
-        if trimmed == "" or trimmed:sub(1, 2) == "--" then
-            -- пропуск комментариев и пустых строк
-
-        elseif trimmed:find("TDS:Place") then
-            local nm, x, y, z, wv, mn, sc, tc, rx, ry, rz = trimmed:match(
-                'TDS:Place%("([^"]+)",%s*' ..
-                '([-%.%deE]+),%s*([-%.%deE]+),%s*([-%.%deE]+),%s*' ..
-                '(%d+),%s*(%d+),%s*([-%.%deE]+),%s*"?([^",%)]+)"?,%s*' ..
-                '([-%.%deE]+),%s*([-%.%deE]+),%s*([-%.%deE]+)%)'
-            )
-            if nm then
-                table.insert(commands, {
-                    type = "Place",
-                    args = {
-                        nm,
-                        tonumber(x), tonumber(y), tonumber(z),
-                        tonumber(wv), tonumber(mn), tonumber(sc), tc,
-                        tonumber(rx), tonumber(ry), tonumber(rz)
-                    },
-                    wave  = tonumber(wv),
-                    order = #commands + 1,
-                })
-            else
-                warn("[Parser] Place не распознан: " .. trimmed)
-            end
-
-        elseif trimmed:find("TDS:Upgrade") then
-            local uid, uwv, umn, usc, utc = trimmed:match(
-                'TDS:Upgrade%((%d+),%s*(%d+),%s*(%d+),%s*([-%.%deE]+),%s*"?([^",%)]+)"?%)'
-            )
-            if uid then
-                table.insert(commands, {
-                    type = "Upgrade",
-                    args = {tonumber(uid), tonumber(uwv), tonumber(umn), tonumber(usc), utc},
-                    wave  = tonumber(uwv),
-                    order = #commands + 1,
-                })
-            else
-                warn("[Parser] Upgrade не распознан: " .. trimmed)
-            end
-
-        elseif trimmed:find("TDS:Sell") then
-            local sid, swv, smn, ssc, stc = trimmed:match(
-                'TDS:Sell%((%d+),%s*(%d+),%s*(%d+),%s*([-%.%deE]+),%s*"?([^",%)]+)"?%)'
-            )
-            if sid then
-                table.insert(commands, {
-                    type = "Sell",
-                    args = {tonumber(sid), tonumber(swv), tonumber(smn), tonumber(ssc), stc},
-                    wave  = tonumber(swv),
-                    order = #commands + 1,
-                })
-            else
-                warn("[Parser] Sell не распознан: " .. trimmed)
-            end
-
-        elseif trimmed:find("TDS:Target") then
-            local tid, tpr, twv, tmn, tsc, ttc = trimmed:match(
-                'TDS:Target%((%d+),%s*"([^"]*)",%s*(%d+),%s*(%d+),%s*([-%.%deE]+),%s*"?([^",%)]+)"?%)'
-            )
-            if tid then
-                table.insert(commands, {
-                    type = "Target",
-                    args = {tonumber(tid), tpr, tonumber(twv), tonumber(tmn), tonumber(tsc), ttc},
-                    wave  = tonumber(twv),
-                    order = #commands + 1,
-                })
-            else
-                warn("[Parser] Target не распознан: " .. trimmed)
-            end
-
-        else
-            warn("[Parser] Нераспознанная строка: " .. trimmed)
-        end
-    end
-
-    print("[Parser] Команд распознано: " .. #commands)
-    return commands
-end
-
--------------------------------------------------
---  ЗАПУСК ВОСПРОИЗВЕДЕНИЯ
--------------------------------------------------
-function Playback:Start(fileName)
+function Playback:Start(fileName, statusCallback)
     if self.Active then
-        warn("[Playback] Уже воспроизводится!")
-        return false
+        return false, "Уже воспроизводится"
     end
-
-    if not FileExists(fileName) then
-        warn("[Playback] Файл не найден: " .. fileName)
-        return false
+    
+    -- Проверяем файл
+    local content = FileManager.Read(fileName)
+    if not content then
+        return false, "Файл не найден: " .. fileName
     end
-
-    local content  = FileRead(fileName)
-    local commands = ParseMacro(content)
-
+    
+    -- Парсим
+    local commands = MacroParser.Parse(content)
     if #commands == 0 then
-        warn("[Playback] Нет команд в файле!")
-        return false
+        return false, "Нет команд в файле"
     end
-
-    self.Active     = true
-    self.Paused     = false
-    self.Towers     = {}
-    self.TowerCount = 0
-
-    print("[Playback] ▶ Старт: " .. fileName .. " (" .. #commands .. " команд)")
-
+    
+    -- Проверяем RF
+    local rf = GameBridge.GetRF()
+    if not rf then
+        return false, "RemoteFunction не найдена"
+    end
+    
+    -- Инициализация
+    self.Active         = true
+    self.Paused         = false
+    self.Towers         = {}
+    self.TowerCount     = 0
+    self.Progress       = 0
+    self.Total          = #commands
+    self.StatusCallback = statusCallback
+    
+    self:_setStatus("▶ Старт: " .. fileName .. " (" .. #commands .. " команд)")
+    
+    -- Запускаем в отдельном потоке
     task.spawn(function()
         for i, cmd in ipairs(commands) do
             if not self.Active then
-                print("[Playback] ■ Остановлено на команде " .. i)
+                self:_setStatus("■ Остановлено на команде " .. i .. "/" .. self.Total)
                 break
             end
-
+            
+            -- Пауза
             while self.Paused and self.Active do
                 task.wait(0.25)
             end
-
-            local fn = TDS[cmd.type]
-            if fn then
+            
+            if not self.Active then break end
+            
+            self.Progress = i
+            
+            -- Выполняем действие
+            local actionFn = PlaybackActions[cmd.Type]
+            if actionFn then
                 local ok, err = pcall(function()
-                    fn(table.unpack(cmd.args))
+                    actionFn(self, table.unpack(cmd.Args))
                 end)
+                
                 if not ok then
-                    warn("[Playback] Ошибка команда " .. i .. " (" .. cmd.type .. "): " .. tostring(err))
+                    warn(string.format(
+                        "[Playback] Ошибка cmd %d/%d (%s L:%d): %s",
+                        i, self.Total, cmd.Type, cmd.Line, tostring(err)
+                    ))
                 end
             else
-                warn("[Playback] Неизвестный тип: " .. cmd.type)
+                warn("[Playback] Неизвестный тип команды: " .. tostring(cmd.Type))
             end
-
-            task.wait(0.1)
+            
+            task.wait(CONFIG.ActionDelay)
         end
-
+        
+        if self.Active then
+            self:_setStatus("✓ Воспроизведение завершено (" .. self.Total .. " команд)")
+        end
+        
         self.Active = false
-        print("[Playback] ✓ Воспроизведение завершено")
     end)
-
-    return true
+    
+    return true, "Воспроизведение начато"
 end
 
 function Playback:Stop()
+    if not self.Active then return end
     self.Active = false
     self.Paused = false
-    print("[Playback] ■ Остановка")
+    self:_setStatus("■ Остановлено")
 end
 
 function Playback:TogglePause()
+    if not self.Active then return false end
     self.Paused = not self.Paused
-    print("[Playback] " .. (self.Paused and "⏸ Пауза" or "▶ Продолжение"))
+    self:_setStatus(self.Paused and "⏸ Пауза" or "▶ Продолжение")
     return self.Paused
 end
 
--------------------------------------------------
---  АВТО-ПРОДАЖА ФЕРМ
--------------------------------------------------
-local AutoSellFarm = {}
-AutoSellFarm.Active = false
+function Playback:GetProgress()
+    if self.Total == 0 then return 0 end
+    return math.floor((self.Progress / self.Total) * 100)
+end
+
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 10: АВТО-ПРОДАЖА ФЕРМ
+-- ═══════════════════════════════════════════════
+
+--[[
+    AutoSellFarm — автоматически продаёт фермы на максимальном уровне.
+    
+    Логика:
+    1. Каждые N секунд сканирует папку Troops в workspace
+    2. Для каждой башни проверяет:
+       - Принадлежит ли локальному игроку (Owner)
+       - Является ли фермой (по имени)
+       - Достигла ли максимального уровня
+    3. Если все условия выполнены — продаёт через RF
+]]
+local AutoSellFarm = {
+    Active    = false,
+    FarmNames = {  -- имена башен-ферм (в нижнем регистре)
+        "farm", "golden farm", "military base",
+    },
+}
+
+function AutoSellFarm:IsFarm(name)
+    local lower = name:lower()
+    for _, farmName in ipairs(self.FarmNames) do
+        if lower:find(farmName, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+function AutoSellFarm:IsOurTower(troop)
+    local owner = troop:FindFirstChild("Owner")
+    if not owner then return false end
+    
+    local val = owner.Value
+    
+    -- Owner может быть разных типов в зависимости от реализации
+    if typeof(val) == "Instance" then
+        return val == LocalPlayer
+    elseif typeof(val) == "string" then
+        return val == LocalPlayer.Name
+    elseif typeof(val) == "number" then
+        return val == LocalPlayer.UserId
+    end
+    
+    return false
+end
+
+function AutoSellFarm:IsMaxLevel(troop)
+    local level    = troop:FindFirstChild("Level")
+    local maxLevel = troop:FindFirstChild("MaxLevel")
+    
+    if level and maxLevel then
+        return level.Value >= maxLevel.Value
+    end
+    
+    return false
+end
 
 function AutoSellFarm:Start()
     if self.Active then return end
     self.Active = true
-
+    
     task.spawn(function()
-        EnsureRemote()
-
+        local rf = GameBridge.GetRF()
+        
         while self.Active do
             pcall(function()
-                local troops = FindTroopsFolder()
-                if not troops then return end
-
-                for _, troop in ipairs(troops:GetChildren()) do
+                if not rf then
+                    rf = GameBridge.GetRF()
+                    return
+                end
+                
+                local troopsFolder = GameBridge.FindTroopsFolder()
+                if not troopsFolder then return end
+                
+                for _, troop in ipairs(troopsFolder:GetChildren()) do
                     if not self.Active then break end
-
-                    local owner = troop:FindFirstChild("Owner")
-                    if not owner then
-                        -- skip
-                    else
-                        local ownerVal = owner.Value
-                        local isOurs = false
-
-                        if typeof(ownerVal) == "Instance" and ownerVal == LocalPlayer then
-                            isOurs = true
-                        elseif typeof(ownerVal) == "string" and ownerVal == LocalPlayer.Name then
-                            isOurs = true
-                        elseif typeof(ownerVal) == "number" and ownerVal == LocalPlayer.UserId then
-                            isOurs = true
-                        end
-
-                        if isOurs then
-                            local towerName = troop.Name:lower()
-                            local isFarm = towerName:find("farm") ~= nil
-
-                            local config = troop:FindFirstChild("Config")
-                                        or troop:FindFirstChild("Configuration")
-                            if config then
-                                local tType = config:FindFirstChild("Type")
-                                          or config:FindFirstChild("TowerType")
-                                if tType and tostring(tType.Value):lower():find("farm") then
-                                    isFarm = true
-                                end
-                            end
-
-                            if isFarm then
-                                local level    = troop:FindFirstChild("Level")
-                                local maxLevel = troop:FindFirstChild("MaxLevel")
-                                if level and maxLevel and level.Value >= maxLevel.Value then
-                                    pcall(function()
-                                        GameRF:InvokeServer("Troops", "Sell", nil, {Troop = troop})
-                                    end)
-                                    print("[AutoSell] Продана ферма: " .. troop.Name)
-                                end
-                            end
+                    
+                    if self:IsOurTower(troop) 
+                       and self:IsFarm(troop.Name) 
+                       and self:IsMaxLevel(troop) then
+                        
+                        local sellOk = pcall(function()
+                            rf:InvokeServer("Troops", "Sell", nil, {Troop = troop})
+                        end)
+                        
+                        if sellOk then
+                            print("[AutoSell] ✓ Продана: " .. troop.Name)
                         end
                     end
                 end
             end)
-
-            task.wait(2)
+            
+            task.wait(CONFIG.AutoSellDelay)
         end
     end)
-
+    
     print("[AutoSell] ▶ Включена")
 end
 
@@ -773,51 +1264,63 @@ function AutoSellFarm:Stop()
     print("[AutoSell] ■ Выключена")
 end
 
--------------------------------------------------
---  RAYFIELD ИНТЕРФЕЙС
--------------------------------------------------
+-- ═══════════════════════════════════════════════
+--  СЕКЦИЯ 11: RAYFIELD UI — ИНТЕРФЕЙС
+-- ═══════════════════════════════════════════════
+
 local Window = Rayfield:CreateWindow({
-    Name            = "TDS Macro v" .. VERSION,
-    LoadingTitle    = "TDS: Reanimated Macro",
-    LoadingSubtitle = "by You | v" .. VERSION,
+    Name              = "TDS: Reanimated Macro",
+    LoadingTitle      = "TDS: Reanimated Macro",
+    LoadingSubtitle   = "v" .. CONFIG.Version .. " | Загрузка...",
     ConfigurationSaving = {
         Enabled  = false,
         FileName = "TDSMacroConfig",
     },
-    KeySystem    = false,
+    Discord = {
+        Enabled = false,
+    },
+    KeySystem = false,
 })
 
--- ===================== ВКЛАДКА: ЗАПИСЬ =====================
-local TabRecord = Window:CreateTab("🔴 Запись", "circle")
+-- ═══════ ВКЛАДКА: ЗАПИСЬ ═══════
 
-local RecFileNameInput = ""
+local TabRecord = Window:CreateTab("Запись", 4483362458)
+
+local RecordFileName  = ""
+local RecordStatusLbl = TabRecord:CreateLabel("⏹ Ожидание")
 
 TabRecord:CreateInput({
-    Name            = "Имя файла",
-    PlaceholderText = "Введите имя макроса...",
+    Name            = "Имя макроса",
+    PlaceholderText = "Введите имя файла...",
     RemoveTextAfterFocusLost = false,
     Callback = function(text)
-        RecFileNameInput = text
+        RecordFileName = text
     end,
 })
 
-local RecStatusLabel = TabRecord:CreateLabel("Статус: Ожидание")
-
 TabRecord:CreateButton({
-    Name     = "▶ Начать запись",
+    Name     = "🔴 Начать запись",
     Callback = function()
-        local name = RecFileNameInput
-        if name == "" then
-            RecStatusLabel:Set("❌ Введите имя файла!")
+        if RecordFileName == "" then
+            RecordStatusLbl:Set("❌ Введите имя файла!")
             return
         end
-        if not name:match("%.lua$") and not name:match("%.txt$") then
+        
+        local name = RecordFileName
+        if not name:match("%.lua$") then
             name = name .. ".lua"
         end
-        if Recorder:Start(name) then
-            RecStatusLabel:Set("🔴 Запись: " .. name)
+        
+        local ok, msg = Recorder:Start(name)
+        if ok then
+            RecordStatusLbl:Set("🔴 Запись: " .. name)
+            Rayfield:Notify({
+                Title   = "Запись начата",
+                Content = "Файл: " .. name,
+                Duration = 3,
+            })
         else
-            RecStatusLabel:Set("❌ Не удалось начать запись")
+            RecordStatusLbl:Set("❌ " .. msg)
         end
     end,
 })
@@ -825,141 +1328,101 @@ TabRecord:CreateButton({
 TabRecord:CreateButton({
     Name     = "⬛ Остановить запись",
     Callback = function()
+        if not Recorder.Active then
+            RecordStatusLbl:Set("❌ Запись не идёт")
+            return
+        end
+        
         Recorder:Stop()
-        RecStatusLabel:Set("⬛ Запись остановлена | Башен: " .. Recorder.TowerCount)
+        RecordStatusLbl:Set("⬛ Остановлено | Башен: " .. Recorder.TowerCount)
+        
+        Rayfield:Notify({
+            Title   = "Запись остановлена",
+            Content = "Записано башен: " .. Recorder.TowerCount,
+            Duration = 3,
+        })
     end,
 })
 
--- ===================== ВКЛАДКА: ВОСПРОИЗВЕДЕНИЕ =====================
-local TabPlay = Window:CreateTab("▶ Воспроизведение", "play")
-
-local PlayFileNameInput = ""
-
-TabPlay:CreateInput({
-    Name            = "Имя файла",
-    PlaceholderText = "Введите имя макроса...",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(text)
-        PlayFileNameInput = text
-    end,
+TabRecord:CreateParagraph({
+    Title   = "Инструкция",
+    Content = "1. Введите имя файла\n" ..
+              "2. Нажмите 'Начать запись'\n" ..
+              "3. Играйте — ставьте, улучшайте, продавайте башни\n" ..
+              "4. Нажмите 'Остановить запись'\n" ..
+              "Все действия сохранятся в файл.",
 })
 
-local PlayStatusLabel = TabPlay:CreateLabel("Статус: Ожидание")
+-- ═══════ ВКЛАДКА: ВОСПРОИЗВЕДЕНИЕ ═══════
 
--- Выпадающий список файлов
-local fileListForDropdown = FileList()
-if #fileListForDropdown == 0 then
-    fileListForDropdown = {"Нет файлов"}
+local TabPlay = Window:CreateTab("Воспроизведение", 4483362458)
+
+local PlayFileName  = ""
+local PlayStatusLbl = TabPlay:CreateLabel("⏹ Ожидание")
+local PlayProgress  = TabPlay:CreateLabel("Прогресс: —")
+
+-- Получаем список файлов
+local function GetFileOptions()
+    local files = FileManager.List()
+    if #files == 0 then
+        return {"— Нет макросов —"}
+    end
+    return files
 end
 
-local FileDropdown = TabPlay:CreateDropdown({
-    Name    = "Выбрать макрос",
-    Options = fileListForDropdown,
-    CurrentOption = {},
+local PlayDropdown
+
+PlayDropdown = TabPlay:CreateDropdown({
+    Name            = "Выбрать макрос",
+    Options         = GetFileOptions(),
+    CurrentOption   = {},
     MultipleOptions = false,
     Callback = function(options)
-        if options and options[1] and options[1] ~= "Нет файлов" then
-            PlayFileNameInput = options[1]
-            PlayStatusLabel:Set("Выбран: " .. options[1])
+        if options and options[1] and options[1] ~= "— Нет макросов —" then
+            PlayFileName = options[1]
+            PlayStatusLbl:Set("Выбран: " .. options[1])
+        end
+    end,
+})
+
+TabPlay:CreateInput({
+    Name            = "Или введите имя",
+    PlaceholderText = "Имя файла...",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        if text ~= "" then
+            PlayFileName = text
+            if not PlayFileName:match("%.lua$") then
+                PlayFileName = PlayFileName .. ".lua"
+            end
+            PlayStatusLbl:Set("Введено: " .. PlayFileName)
         end
     end,
 })
 
 TabPlay:CreateButton({
-    Name     = "🔄 Обновить список файлов",
+    Name     = "🔄 Обновить список",
     Callback = function()
-        local newList = FileList()
-        if #newList == 0 then
-            newList = {"Нет файлов"}
-        end
-        FileDropdown:Set(newList)
-        PlayStatusLabel:Set("Список обновлён (" .. #newList .. " файлов)")
+        local newOptions = GetFileOptions()
+        PlayDropdown:Set(newOptions)
+        PlayStatusLbl:Set("Список обновлён (" .. #newOptions .. ")")
     end,
 })
 
 TabPlay:CreateButton({
     Name     = "▶ Воспроизвести",
     Callback = function()
-        local name = PlayFileNameInput
-        if name == "" or name == "Нет файлов" then
-            PlayStatusLabel:Set("❌ Выберите или введите имя файла!")
+        if PlayFileName == "" or PlayFileName == "— Нет макросов —" then
+            PlayStatusLbl:Set("❌ Выберите макрос!")
             return
         end
-        if Playback:Start(name) then
-            PlayStatusLabel:Set("▶ Воспроизведение: " .. name)
-        else
-            PlayStatusLabel:Set("❌ Не удалось начать воспроизведение")
-        end
-    end,
-})
-
-TabPlay:CreateButton({
-    Name     = "⏸ Пауза / Продолжить",
-    Callback = function()
-        local paused = Playback:TogglePause()
-        PlayStatusLabel:Set(paused and "⏸ Пауза" or "▶ Продолжение воспроизведения")
-    end,
-})
-
-TabPlay:CreateButton({
-    Name     = "⬛ Остановить",
-    Callback = function()
-        Playback:Stop()
-        PlayStatusLabel:Set("⬛ Воспроизведение остановлено")
-    end,
-})
-
--- ===================== ВКЛАДКА: АВТО-ФУНКЦИИ =====================
-local TabAuto = Window:CreateTab("🔧 Авто-функции", "settings")
-
-local AutoSellLabel = TabAuto:CreateLabel("Авто-продажа ферм: ВЫКЛ")
-
-TabAuto:CreateToggle({
-    Name          = "Авто-продажа ферм (макс. уровень)",
-    CurrentValue  = false,
-    Flag          = "AutoSellFarmToggle",
-    Callback = function(value)
-        if value then
-            AutoSellFarm:Start()
-            AutoSellLabel:Set("Авто-продажа ферм: ВКЛ ✅")
-        else
-            AutoSellFarm:Stop()
-            AutoSellLabel:Set("Авто-продажа ферм: ВЫКЛ ❌")
-        end
-    end,
-})
-
--- ===================== ВКЛАДКА: ИНФОРМАЦИЯ =====================
-local TabInfo = Window:CreateTab("ℹ Инфо", "info")
-
-TabInfo:CreateLabel("TDS: Reanimated Macro v" .. VERSION)
-TabInfo:CreateLabel("Папка макросов: " .. MACRO_FOLDER)
-
-TabInfo:CreateParagraph({
-    Title   = "Как использовать",
-    Content = "1. Зайдите в лобби и выберите карту\n" ..
-              "2. Откройте вкладку 'Запись' и начните запись\n" ..
-              "3. Играйте — ставьте/прокачивайте/продавайте башни\n" ..
-              "4. Остановите запись\n" ..
-              "5. В следующей игре откройте 'Воспроизведение'\n" ..
-              "6. Выберите файл и нажмите 'Воспроизвести'\n\n" ..
-              "Горячие клавиши:\n" ..
-              "F9 — показать/скрыть интерфейс",
-})
-
-TabInfo:CreateButton({
-    Name     = "📂 Показать файлы в консоли",
-    Callback = function()
-        local files = FileList()
-        print("=== Макро-файлы ===")
-        for i, f in ipairs(files) do
-            print(i .. ". " .. f)
-        end
-        print("===================")
-    end,
-})
-
--------------------------------------------------
---  ГОТОВО
--------------------------------------------------
-print(string.format("[TDS Macro v%s] ✓ Загружен успешно", VERSION))
+        
+        local ok, msg = Playback:Start(PlayFileName, function(statusText)
+            pcall(function()
+                PlayStatusLbl:Set(statusText)
+                PlayProgress:Set("Прогресс: " .. Playback:GetProgress() .. "% (" ..
+                                 Playback.Progress .. "/" .. Playback.Total .. ")")
+            end)
+        end)
+        
+        
