@@ -50,11 +50,11 @@ warn("[AutoChain] Инициализация: OK")
 -- КОНСТАНТЫ
 -- ═══════════════════════════════════════════════════════════════
 
-local BUFF_DURATION    = 10.0
+local BUFF_DURATION    = 10.5
 local ABILITY_COOLDOWN = 34.0
 local ABILITY_NAME     = "Call Of Arms"
 local COMMANDER_TYPE   = "Commander"
-local ACTIVATION_LEAD  = 0.5
+local ACTIVATION_LEAD  = 0.1
 
 -- ═══════════════════════════════════════════════════════════════
 -- СОСТОЯНИЕ
