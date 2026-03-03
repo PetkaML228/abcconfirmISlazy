@@ -49,7 +49,7 @@ local COMMANDER_TYPE   = "Commander"
 -- За сколько секунд ДО окончания баффа активировать следующего командира.
 -- Компенсирует сетевую задержку и лаг сервера.
 -- 0.5 = активируем следующего за 0.5с до окончания текущего баффа.
-local ACTIVATION_LEAD_TIME = 0.1
+local ACTIVATION_LEAD_TIME = 0.0
 
 -- ═══════════════════════════════════════════════════════════════
 -- БЛОК 3: СОСТОЯНИЕ СИСТЕМЫ
@@ -472,7 +472,7 @@ MainTab:CreateSlider({
 
 MainTab:CreateSlider({
     Name         = "Упреждение активации (сек)",
-    Range        = {0.1, 2.0},
+    Range        = {0.0, 2.0},
     Increment    = 0.1,
     Suffix       = "с",
     CurrentValue = ACTIVATION_LEAD_TIME,
