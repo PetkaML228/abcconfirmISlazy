@@ -61,11 +61,11 @@ warn("[AutoChain] Ремоуты и Towers: OK")
 -- БЛОК 3: КОНСТАНТЫ
 -- ═══════════════════════════════════════════════════════════════
 
-local BUFF_DURATION    = 10.0
-local ABILITY_COOLDOWN = 34.0   -- В Reanimated КД = 34с
+local BUFF_DURATION    = 10.5
+local ABILITY_COOLDOWN = 2.0   -- В Reanimated КД = 34с
 local ABILITY_NAME     = "Call Of Arms"
 local COMMANDER_TYPE   = "Commander"
-local ACTIVATION_LEAD  = 0.5
+local ACTIVATION_LEAD  = 0.1
 
 -- ═══════════════════════════════════════════════════════════════
 -- БЛОК 4: СОСТОЯНИЕ
