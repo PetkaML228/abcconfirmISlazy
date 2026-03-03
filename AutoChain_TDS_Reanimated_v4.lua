@@ -61,11 +61,11 @@ warn("[AutoChain] Ремоуты и Towers: OK")
 -- БЛОК 3: КОНСТАНТЫ
 -- ═══════════════════════════════════════════════════════════════
 
-local BUFF_DURATION    = 10.5
-local ABILITY_COOLDOWN = 2.0   -- В Reanimated КД = 34с
+local BUFF_DURATION    = 10.0
+local ABILITY_COOLDOWN = 1.0   -- В Reanimated КД = 34с
 local ABILITY_NAME     = "Call Of Arms"
 local COMMANDER_TYPE   = "Commander"
-local ACTIVATION_LEAD  = 0.1
+local ACTIVATION_LEAD  = 0.0
 
 -- ═══════════════════════════════════════════════════════════════
 -- БЛОК 4: СОСТОЯНИЕ
@@ -371,14 +371,14 @@ if Rayfield then
 
         Main:CreateSlider({
             Name = "Упреждение активации (сек)",
-            Range = {0.1, 2.0}, Increment = 0.1, Suffix = "с",
+            Range = {0.0, 2.0}, Increment = 0.1, Suffix = "с",
             CurrentValue = ACTIVATION_LEAD, Flag = "LeadTime",
             Callback = function(v) ACTIVATION_LEAD = v end,
         })
 
         Main:CreateSlider({
             Name = "Кулдаун командира (сек)",
-            Range = {2, 45}, Increment = 1, Suffix = "с",
+            Range = {1, 45}, Increment = 1, Suffix = "с",
             CurrentValue = ABILITY_COOLDOWN, Flag = "AbilityCD",
             Callback = function(v) ABILITY_COOLDOWN = v end,
         })
