@@ -378,7 +378,7 @@ if Rayfield then pcall(function()
         if was and #SwState.Swarmers > 0 then StartSwarmer() end
     end })
 
-    SwTab:CreateSlider({ Name="Кулдаун Swarmer (сек)", Range={10,30}, Increment=1,
+    SwTab:CreateSlider({ Name="Кулдаун Swarmer (сек)", Range={10,30}, Increment=0.5,
         Suffix="с", CurrentValue=SWARMER_COOLDOWN, Flag="SwarmerCD",
         Callback=function(v) SWARMER_COOLDOWN=v end })
 
