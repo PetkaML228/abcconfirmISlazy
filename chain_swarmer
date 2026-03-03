@@ -36,7 +36,7 @@ local ACTIVATION_LEAD  = 0.0
 -- Константы Swarmer
 local SWARMER_TYPE      = "Swarmer"
 local SWARMER_ABILITY   = "Swarm"
-local SWARMER_COOLDOWN  = 19.0
+local SWARMER_COOLDOWN  = 20.5
 local SWARMER_MIN_LEVEL = 4
 
 -- Состояние Commander
@@ -231,7 +231,7 @@ local function ActivateAllSwarmers(list)
     local count = 0
     for _, sw in ipairs(list) do
         if sw.model and sw.model.Parent then
-            if ActivateSwarmer(sw) then count += 1; task.wait(0.2) end
+            if ActivateSwarmer(sw) then count += 1; task.wait(0.1) end
         end
     end
     return count
