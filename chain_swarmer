@@ -1,0 +1,443 @@
+--[[
+    AutoChain + Swarmer v5.2 — TDS: Reanimated
+]]
+
+local function SafeInit()
+
+local Players, ReplicatedStorage, Workspace
+do
+    local ok
+    ok, Players           = pcall(game.GetService, game, "Players")
+    if not ok then error("Players: " .. tostring(Players)) end
+    ok, ReplicatedStorage = pcall(game.GetService, game, "ReplicatedStorage")
+    if not ok then error("ReplicatedStorage: " .. tostring(ReplicatedStorage)) end
+    ok, Workspace         = pcall(game.GetService, game, "Workspace")
+    if not ok then error("Workspace: " .. tostring(Workspace)) end
+end
+
+local LocalPlayer    = Players.LocalPlayer
+if not LocalPlayer   then error("LocalPlayer не найден") end
+
+local RemoteFunction = ReplicatedStorage:WaitForChild("RemoteFunction", 10)
+if not RemoteFunction then error("RemoteFunction не найден") end
+
+local TowersFolder   = Workspace:WaitForChild("Towers", 10)
+if not TowersFolder  then error("Towers не найден — ты в лобби?") end
+
+warn("[Script] Инициализация: OK")
+
+-- Константы Commander
+local BUFF_DURATION    = 10.0
+local ABILITY_COOLDOWN = 34.0
+local ABILITY_NAME     = "Call Of Arms"
+local COMMANDER_TYPE   = "Commander"
+local ACTIVATION_LEAD  = 0.0
+
+-- Константы Swarmer
+local SWARMER_TYPE      = "Swarmer"
+local SWARMER_ABILITY   = "Swarm"
+local SWARMER_COOLDOWN  = 19.0
+local SWARMER_MIN_LEVEL = 4
+
+-- Состояние Commander
+local State = {
+    Enabled=false, Commanders={}, QueueIndex=1,
+    ActivationCount=0, ScheduledThread=nil, LastChainTime=0,
+}
+
+-- Состояние Swarmer
+local SwState = {
+    Enabled=false, Swarmers={}, ActivationCount=0, Thread=nil,
+}
+
+local debugMode = false
+
+-- ── Вспомогательные ────────────────────────────────────────────
+
+local function IsOwned(model)
+    local ok, r = pcall(function()
+        local o = model:FindFirstChild("Owner")
+        return o and o.Value == LocalPlayer
+    end)
+    return ok and r
+end
+
+local function GetType(model)
+    local ok, r = pcall(function()
+        local t = model:FindFirstChild("Type")
+        return t and t:IsA("StringValue") and t.Value or ""
+    end)
+    return ok and r or ""
+end
+
+local function GetLevel(model)
+    local ok, r = pcall(function()
+        local u = model:FindFirstChild("Upgrade")
+        return u and u:IsA("IntValue") and u.Value or 0
+    end)
+    return ok and r or 0
+end
+
+local function DbgLog(msg)
+    if debugMode then warn("[DBG] " .. tostring(msg)) end
+end
+
+-- Проверяет ответ сервера. Возвращает true если активация прошла.
+local function CheckResult(ok, result, name, tag)
+    if not ok then
+        warn(string.format("[%s][ERROR] Вызов упал '%s': %s", tag, name, tostring(result)))
+        return false
+    end
+    if result == false then
+        DbgLog(string.format("[%s] Отклонено сервером: %s", tag, name))
+        return false
+    end
+    if type(result) == "string"
+    and (result:lower():find("cooldown") or result:lower():find("error")) then
+        DbgLog(string.format("[%s] Ошибка-строка '%s': %s", tag, name, result))
+        return false
+    end
+    return true
+end
+
+-- ── Commander: сканирование ─────────────────────────────────────
+
+local function ScanCommanders()
+    local found = {}
+    pcall(function()
+        for _, m in ipairs(TowersFolder:GetChildren()) do
+            if m:IsA("Model") and IsOwned(m) and GetType(m) == COMMANDER_TYPE then
+                table.insert(found, { model=m, name=m.Name, level=GetLevel(m), cooldownUntil=0 })
+            end
+        end
+    end)
+    table.sort(found, function(a,b) return a.level > b.level end)
+    warn(string.format("[AutoChain] Командиров: %d", #found))
+    for i,c in ipairs(found) do warn(string.format("  [%d] %s ур.%d", i, c.name, c.level)) end
+    return found
+end
+
+-- ── Commander: активация ────────────────────────────────────────
+
+local function Activate(cmd)
+    if not (cmd.model and cmd.model.Parent) then
+        warn("[AutoChain][WARN] '" .. cmd.name .. "' удалён")
+        return false
+    end
+    local ok, result = pcall(function()
+        return RemoteFunction:InvokeServer("Troops","Abilities","Activate",
+            { Name=ABILITY_NAME, Troop=cmd.model })
+    end)
+    DbgLog(string.format("Commander '%s': ok=%s result=%s", cmd.name, tostring(ok), tostring(result)))
+    if not CheckResult(ok, result, cmd.name, "AutoChain") then return false end
+    cmd.cooldownUntil = os.clock() + ABILITY_COOLDOWN
+    State.ActivationCount += 1
+    warn(string.format("[AutoChain] Активирован: %s (всего: %d)", cmd.name, State.ActivationCount))
+    return true
+end
+
+-- ── Commander: цепочка ──────────────────────────────────────────
+
+local function ScheduleNext()
+    if not State.Enabled then return end
+    for i = #State.Commanders, 1, -1 do
+        if not State.Commanders[i].model.Parent then
+            table.remove(State.Commanders, i)
+        end
+    end
+    if #State.Commanders == 0 then State.Enabled = false; return end
+    if State.QueueIndex > #State.Commanders then State.QueueIndex = 1 end
+
+    local cmd = State.Commanders[State.QueueIndex]
+    local now = os.clock()
+    local chainWait = State.LastChainTime == 0 and 0
+        or (State.LastChainTime + BUFF_DURATION - ACTIVATION_LEAD) - now
+    local waitTime = math.max(0, chainWait, cmd.cooldownUntil - now)
+
+    DbgLog(string.format("Следующий: %s через %.2fс", cmd.name, waitTime))
+
+    State.ScheduledThread = task.delay(waitTime, function()
+        if not State.Enabled then return end
+        local ok2, err2 = pcall(function()
+            if Activate(cmd) then
+                State.LastChainTime = os.clock()
+                State.QueueIndex = (State.QueueIndex % #State.Commanders) + 1
+                ScheduleNext()
+            else
+                task.wait(1); ScheduleNext()
+            end
+        end)
+        if not ok2 then warn("[AutoChain][ERROR] " .. tostring(err2)); task.wait(2); ScheduleNext() end
+    end)
+end
+
+local function StartChain()
+    if State.Enabled then return false end
+    State.Commanders = ScanCommanders()
+    if #State.Commanders == 0 then warn("[AutoChain] Не найдены!"); return false end
+    State.Enabled=true; State.QueueIndex=1; State.ActivationCount=0; State.LastChainTime=0
+    for _, c in ipairs(State.Commanders) do c.cooldownUntil = 0 end
+    warn("[AutoChain] Запущена"); ScheduleNext(); return true
+end
+
+local function StopChain()
+    if not State.Enabled then return end
+    State.Enabled = false
+    if State.ScheduledThread then task.cancel(State.ScheduledThread); State.ScheduledThread=nil end
+    warn(string.format("[AutoChain] Остановлена. Активаций: %d", State.ActivationCount))
+end
+
+-- ── Swarmer: сканирование ───────────────────────────────────────
+
+local function ScanSwarmers()
+    local found = {}
+    pcall(function()
+        for _, m in ipairs(TowersFolder:GetChildren()) do
+            if m:IsA("Model") and IsOwned(m)
+            and GetType(m) == SWARMER_TYPE
+            and GetLevel(m) >= SWARMER_MIN_LEVEL then
+                table.insert(found, { model=m, name=m.Name, level=GetLevel(m), cooldownUntil=0 })
+            end
+        end
+    end)
+    warn(string.format("[Swarmer] Найдено (ур.%d+): %d", SWARMER_MIN_LEVEL, #found))
+    for i,s in ipairs(found) do warn(string.format("  [%d] %s ур.%d", i, s.name, s.level)) end
+    return found
+end
+
+-- ── Swarmer: активация одной башни ─────────────────────────────
+
+local function ActivateSwarmer(sw)
+    if not (sw.model and sw.model.Parent) then return false end
+    if os.clock() < sw.cooldownUntil then
+        DbgLog(string.format("Swarmer '%s' КД %.1fс", sw.name, sw.cooldownUntil-os.clock()))
+        return false
+    end
+    local ok, result = pcall(function()
+        return RemoteFunction:InvokeServer("Troops","Abilities","Activate",
+            { Name=SWARMER_ABILITY, Troop=sw.model })
+    end)
+    DbgLog(string.format("Swarmer '%s': ok=%s result=%s", sw.name, tostring(ok), tostring(result)))
+    if not CheckResult(ok, result, sw.name, "Swarmer") then return false end
+    sw.cooldownUntil = os.clock() + SWARMER_COOLDOWN
+    SwState.ActivationCount += 1
+    warn(string.format("[Swarmer] Активирован: %s (всего: %d)", sw.name, SwState.ActivationCount))
+    return true
+end
+
+-- ── Swarmer: активация всех ────────────────────────────────────
+
+local function ActivateAllSwarmers(list)
+    local count = 0
+    for _, sw in ipairs(list) do
+        if sw.model and sw.model.Parent then
+            if ActivateSwarmer(sw) then count += 1; task.wait(0.2) end
+        end
+    end
+    return count
+end
+
+-- ── Swarmer: авто-цикл ─────────────────────────────────────────
+
+local function ScheduleSwarmer()
+    if not SwState.Enabled then return end
+    for i = #SwState.Swarmers, 1, -1 do
+        if not SwState.Swarmers[i].model.Parent then table.remove(SwState.Swarmers, i) end
+    end
+    if #SwState.Swarmers == 0 then SwState.Enabled=false; return end
+
+    local now, minReady = os.clock(), math.huge
+    for _, sw in ipairs(SwState.Swarmers) do
+        if sw.cooldownUntil < minReady then minReady = sw.cooldownUntil end
+    end
+
+    DbgLog(string.format("Swarmer: следующий цикл через %.2fс", math.max(0, minReady-now)))
+
+    SwState.Thread = task.delay(math.max(0, minReady-now), function()
+        if not SwState.Enabled then return end
+        local ok2, err2 = pcall(function()
+            ActivateAllSwarmers(SwState.Swarmers); ScheduleSwarmer()
+        end)
+        if not ok2 then warn("[Swarmer][ERROR] " .. tostring(err2)); task.wait(2); ScheduleSwarmer() end
+    end)
+end
+
+local function StartSwarmer()
+    if SwState.Enabled then return false end
+    SwState.Swarmers = ScanSwarmers()
+    if #SwState.Swarmers == 0 then
+        warn("[Swarmer] Не найдены (нужен ур." .. SWARMER_MIN_LEVEL .. "+)")
+        return false
+    end
+    SwState.Enabled=true; SwState.ActivationCount=0
+    for _, sw in ipairs(SwState.Swarmers) do sw.cooldownUntil=0 end
+    warn("[Swarmer] Запущена"); ScheduleSwarmer(); return true
+end
+
+local function StopSwarmer()
+    if not SwState.Enabled then return end
+    SwState.Enabled = false
+    if SwState.Thread then task.cancel(SwState.Thread); SwState.Thread=nil end
+    warn(string.format("[Swarmer] Остановлена. Активаций: %d", SwState.ActivationCount))
+end
+
+-- ── Rayfield UI ─────────────────────────────────────────────────
+
+local Rayfield
+do
+    local ok, r = pcall(function()
+        return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+    end)
+    if not ok then warn("[ERROR] Rayfield: " .. tostring(r))
+    else Rayfield = r; warn("[Script] Rayfield: OK") end
+end
+
+if Rayfield then pcall(function()
+
+    local W = Rayfield:CreateWindow({
+        Name="TDS: Reanimated Tools", LoadingTitle="TDS Tools v5.2",
+        LoadingSubtitle="AutoChain + Swarmer",
+        ConfigurationSaving={Enabled=true, FileName="TDS_Tools_v5"}, KeySystem=false,
+    })
+
+    -- ── AutoChain вкладка ───────────────────────────────────────
+    local Main = W:CreateTab("AutoChain", nil)
+    Main:CreateSection("Управление")
+
+    Main:CreateToggle({ Name="Commander Chain", CurrentValue=false, Flag="ChainToggle",
+        Callback=function(on)
+            if on then
+                local s = StartChain()
+                Rayfield:Notify({ Title="AutoChain", Duration=4, Image="rbxassetid://4483345998",
+                    Content=s and ("Запущен! Командиров: "..#State.Commanders) or "Не найдены" })
+            else
+                StopChain()
+                Rayfield:Notify({ Title="AutoChain", Duration=3, Image="rbxassetid://4483345998",
+                    Content="Остановлен. Активаций: "..State.ActivationCount })
+            end
+        end,
+    })
+
+    Main:CreateButton({ Name="Пересканировать командиров", Callback=function()
+        local was = State.Enabled; if was then StopChain() end
+        State.Commanders = ScanCommanders()
+        Rayfield:Notify({ Title="AutoChain", Duration=4, Image="rbxassetid://4483345998",
+            Content="Найдено: "..#State.Commanders })
+        if was and #State.Commanders > 0 then StartChain() end
+    end })
+
+    Main:CreateSection("Настройки тайминга")
+    Main:CreateSlider({ Name="Длительность баффа (сек)", Range={5,15}, Increment=0.5,
+        Suffix="с", CurrentValue=BUFF_DURATION, Flag="BuffDur",
+        Callback=function(v) BUFF_DURATION=v end })
+    Main:CreateSlider({ Name="Упреждение активации (сек)", Range={0,2}, Increment=0.1,
+        Suffix="с", CurrentValue=ACTIVATION_LEAD, Flag="LeadTime",
+        Callback=function(v) ACTIVATION_LEAD=v end })
+    Main:CreateSlider({ Name="Кулдаун командира (сек)", Range={25,45}, Increment=1,
+        Suffix="с", CurrentValue=ABILITY_COOLDOWN, Flag="AbilityCD",
+        Callback=function(v) ABILITY_COOLDOWN=v end })
+
+    -- ── Swarmer вкладка ─────────────────────────────────────────
+    local SwTab = W:CreateTab("Swarmer", nil)
+    SwTab:CreateSection("Разовая активация")
+
+    SwTab:CreateButton({ Name="Активировать всех Swarmer", Callback=function()
+        local list = ScanSwarmers()
+        if #list == 0 then
+            Rayfield:Notify({ Title="Swarmer", Duration=4, Image="rbxassetid://4483345998",
+                Content="Не найдены (нужен ур."..SWARMER_MIN_LEVEL.."+)" })
+            return
+        end
+        local n = ActivateAllSwarmers(list)
+        Rayfield:Notify({ Title="Swarmer", Duration=4, Image="rbxassetid://4483345998",
+            Content=string.format("Активировано: %d / %d", n, #list) })
+    end })
+
+    SwTab:CreateSection("Авто-активация")
+
+    SwTab:CreateToggle({ Name="Авто-Swarmer", CurrentValue=false, Flag="SwarmerToggle",
+        Callback=function(on)
+            if on then
+                local s = StartSwarmer()
+                Rayfield:Notify({ Title="Swarmer", Duration=4, Image="rbxassetid://4483345998",
+                    Content=s and ("Запущен! Башен: "..#SwState.Swarmers)
+                        or "Не найдены (нужен ур."..SWARMER_MIN_LEVEL.."+)" })
+            else
+                StopSwarmer()
+                Rayfield:Notify({ Title="Swarmer", Duration=3, Image="rbxassetid://4483345998",
+                    Content="Остановлен. Активаций: "..SwState.ActivationCount })
+            end
+        end,
+    })
+
+    SwTab:CreateButton({ Name="Пересканировать Swarmer", Callback=function()
+        local was = SwState.Enabled; if was then StopSwarmer() end
+        SwState.Swarmers = ScanSwarmers()
+        Rayfield:Notify({ Title="Swarmer", Duration=4, Image="rbxassetid://4483345998",
+            Content="Найдено: "..#SwState.Swarmers.." (ур."..SWARMER_MIN_LEVEL.."+)" })
+        if was and #SwState.Swarmers > 0 then StartSwarmer() end
+    end })
+
+    SwTab:CreateSlider({ Name="Кулдаун Swarmer (сек)", Range={10,30}, Increment=1,
+        Suffix="с", CurrentValue=SWARMER_COOLDOWN, Flag="SwarmerCD",
+        Callback=function(v) SWARMER_COOLDOWN=v end })
+
+    SwTab:CreateSection("Информация")
+    SwTab:CreateLabel("Способность: Swarm | КД: 19с | Уровень: 4+")
+    SwTab:CreateLabel("Разовая — активирует всех одним нажатием")
+    SwTab:CreateLabel("Авто — активирует сразу как КД спадает")
+
+    -- ── Отладка вкладка ─────────────────────────────────────────
+    local Dbg = W:CreateTab("Отладка", nil)
+    Dbg:CreateToggle({ Name="Подробный лог", CurrentValue=false, Flag="DebugLog",
+        Callback=function(v) debugMode=v end })
+
+    Dbg:CreateButton({ Name="Статус AutoChain", Callback=function()
+        local now = os.clock()
+        warn("[AutoChain] "..( State.Enabled and "АКТИВНА" or "СТОП")
+            .." | Активаций: "..State.ActivationCount)
+        for i,c in ipairs(State.Commanders) do
+            warn(string.format("  [%d]%s %s ур.%d КД:%.1fс",
+                i, i==State.QueueIndex and ">" or " ",
+                c.name, c.level, math.max(0,c.cooldownUntil-now)))
+        end
+        Rayfield:Notify({Title="Статус",Content="Смотри Output/F9",
+            Duration=3,Image="rbxassetid://4483345998"})
+    end })
+
+    Dbg:CreateButton({ Name="Статус Swarmer", Callback=function()
+        local now = os.clock()
+        warn("[Swarmer] "..(SwState.Enabled and "АКТИВНА" or "СТОП")
+            .." | Активаций: "..SwState.ActivationCount)
+        for i,s in ipairs(SwState.Swarmers) do
+            warn(string.format("  [%d] %s ур.%d КД:%.1fс",
+                i, s.name, s.level, math.max(0,s.cooldownUntil-now)))
+        end
+        Rayfield:Notify({Title="Статус Swarmer",Content="Смотри Output/F9",
+            Duration=3,Image="rbxassetid://4483345998"})
+    end })
+
+    -- ── Помощь ──────────────────────────────────────────────────
+    local Help = W:CreateTab("Помощь", nil)
+    Help:CreateSection("AutoChain")
+    Help:CreateLabel("1. Разместить 3-4 Командира (уровень 2+)")
+    Help:CreateLabel("2. Пересканировать → Включить Chain")
+    Help:CreateLabel("КД=34с, Бафф=10с | 4 башни = 100% покрытие")
+    Help:CreateSection("Swarmer")
+    Help:CreateLabel("1. Разместить Swarmer (уровень 4+)")
+    Help:CreateLabel("2. Разовая кнопка или включить Авто")
+
+end) end
+
+Players.PlayerRemoving:Connect(function(p)
+    if p == LocalPlayer then pcall(StopChain); pcall(StopSwarmer) end
+end)
+
+warn("[Script] v5.2 загружен — AutoChain + Swarmer")
+end
+
+local ok, err = pcall(SafeInit)
+if not ok then
+    warn("КРИТИЧЕСКАЯ ОШИБКА: " .. tostring(err))
+    warn("Причины: лобби / не загружена игра / нет интернета")
+end
