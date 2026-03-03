@@ -42,14 +42,14 @@ local TowersFolder   = Workspace:WaitForChild("Towers")
 -- ═══════════════════════════════════════════════════════════════
 
 local BUFF_DURATION    = 10.0   -- Сколько секунд длится бафф "Call Of Arms"
-local ABILITY_COOLDOWN = 30.0   -- Кулдаун командира после активации (секунды)
+local ABILITY_COOLDOWN = 34.0   -- Кулдаун командира после активации (секунды)
 local ABILITY_NAME     = "Call Of Arms"
 local COMMANDER_TYPE   = "Commander"
 
 -- За сколько секунд ДО окончания баффа активировать следующего командира.
 -- Компенсирует сетевую задержку и лаг сервера.
 -- 0.5 = активируем следующего за 0.5с до окончания текущего баффа.
-local ACTIVATION_LEAD_TIME = 0.5
+local ACTIVATION_LEAD_TIME = 0.1
 
 -- ═══════════════════════════════════════════════════════════════
 -- БЛОК 3: СОСТОЯНИЕ СИСТЕМЫ
@@ -296,7 +296,7 @@ local function ChainLoop()
             -- Ждём нужное время, проверяя каждые 0.05с не выключили ли нас
             local waited = 0
             while waited < waitTime and State.Enabled do
-                local step = math.min(0.05, waitTime - waited)
+                local step = math.min(1, waitTime - waited)
                 task.wait(step)
                 waited += step
             end
