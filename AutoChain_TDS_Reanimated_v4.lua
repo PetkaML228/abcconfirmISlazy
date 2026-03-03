@@ -378,7 +378,7 @@ if Rayfield then
 
         Main:CreateSlider({
             Name = "Кулдаун командира (сек)",
-            Range = {25, 45}, Increment = 1, Suffix = "с",
+            Range = {2, 45}, Increment = 1, Suffix = "с",
             CurrentValue = ABILITY_COOLDOWN, Flag = "AbilityCD",
             Callback = function(v) ABILITY_COOLDOWN = v end,
         })
