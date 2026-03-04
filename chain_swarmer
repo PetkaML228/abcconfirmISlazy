@@ -27,7 +27,7 @@ if not TowersFolder  then error("Towers не найден — ты в лобби
 warn("[Script] Инициализация: OK")
 
 -- Константы Commander
-local BUFF_DURATION    = 10.0
+local BUFF_DURATION    = 10.2
 local ABILITY_COOLDOWN = 34.0
 local ABILITY_NAME     = "Call Of Arms"
 local COMMANDER_TYPE   = "Commander"
@@ -327,7 +327,7 @@ if Rayfield then pcall(function()
     end })
 
     Main:CreateSection("Настройки тайминга")
-    Main:CreateSlider({ Name="Длительность баффа (сек)", Range={5,15}, Increment=0.5,
+    Main:CreateSlider({ Name="Длительность баффа (сек)", Range={5,15}, Increment=0.1,
         Suffix="с", CurrentValue=BUFF_DURATION, Flag="BuffDur",
         Callback=function(v) BUFF_DURATION=v end })
     Main:CreateSlider({ Name="Упреждение активации (сек)", Range={0,2}, Increment=0.1,
