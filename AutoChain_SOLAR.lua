@@ -76,7 +76,7 @@ local ABILITY_NAME     = "Call Of Arms"
 local COMMANDER_TYPE   = "Commander"
 local BUFF_DURATION    = 10.0
 local ABILITY_COOLDOWN = 50.0
-local ACTIVATION_LEAD  = 0.0
+local ACTIVATION_LEAD  = 0.1
 
 -- ═══════════════════════════════════════════════════════════════
 -- СОСТОЯНИЕ
@@ -92,7 +92,7 @@ local State = {
     RetryCount      = 0,   -- счётчик подряд идущих неудачных попыток
 }
 
-local MAX_RETRIES = 5      -- максимум повторов прежде чем пропустить командира
+local MAX_RETRIES = 10      -- максимум повторов прежде чем пропустить командира
 local debugMode   = false
 
 -- ═══════════════════════════════════════════════════════════════
