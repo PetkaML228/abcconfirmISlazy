@@ -76,7 +76,7 @@ local ABILITY_NAME     = "Call Of Arms"
 local COMMANDER_TYPE   = "Commander"
 local BUFF_DURATION    = 10.0
 local ABILITY_COOLDOWN = 50.0
-local ACTIVATION_LEAD  = 0.0
+local ACTIVATION_LEAD  = 0.1
 
 -- ═══════════════════════════════════════════════════════════════
 -- СОСТОЯНИЕ
