@@ -110,7 +110,7 @@ local function StartAutoSkip()
     State.LastSkipTime = 0
 
     -- Сразу пробуем скипнуть текущую волну
-    task.delay(0.3, function()
+    task.delay(0.1, function()
         if State.Enabled then SendSkip("старт") end
     end)
 
@@ -120,7 +120,7 @@ local function StartAutoSkip()
         if not State.Enabled then return end
         if value == true then
             -- Небольшая задержка чтобы сервер успел открыть голосование
-            task.delay(0.2, function()
+            task.delay(0.1, function()
                 if State.Enabled then SendSkip("таймер включился") end
             end)
         end
