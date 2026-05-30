@@ -1,6 +1,6 @@
 --[[
     Commander AutoChain + Gladiator Auto-Ability — TDS: S.O.L.A.R
-    Версия: 1.2.0 | UI: Rayfield
+    Версия: 1.3.0 | UI: Rayfield
 
     МЕХАНИКА COMMANDER ЦЕПОЧКИ:
     • Кулдаун: 50с | Бафф: 10с | Нужно: 5 командиров
@@ -8,15 +8,19 @@
     T=50с → A (кулдаун закончился — цикл замкнулся)
 
     МЕХАНИКА GLADIATOR:
+    • Способность доступна с 3 уровня
     • Кулдаун: 30с | Способность: Warrior's Call
-    • Активирует всех Gladiator'ов сразу как только кулдаун спадает
-    • Учитывает стан башни — пропускает попытку и повторяет через 1с
+    • Каждая башня работает в своём независимом потоке
+    • Активации происходят параллельно — задержка между ними ~0мс
+    • При стане: повтор каждые GLAD_STUN_RETRY секунд
+    • После GLAD_MAX_RETRIES неудачных попыток — пауза на кулдаун
 
-    ОПТИМИЗАЦИЯ v1.2:
+    ОПТИМИЗАЦИЯ v1.3:
     • Нет task.wait() внутри колбэков — только task.delay()
-    • Gladiator и Commander работают в независимых потоках
-    • Стан определяется по атрибуту Replicator (Stunned / StunTime)
-    • Повторные попытки при стане не накапливают потоки
+    • Каждый Gladiator = отдельный поток, нет взаимной блокировки
+    • Параллельные активации через coroutine + task.delay(0)
+    • Стан проверяется до отправки запроса — экономия трафика
+    • Gladiator ниже 3 уровня автоматически игнорируется
 ]]
 
 local function SafeInit()
@@ -28,12 +32,12 @@ local function SafeInit()
 local Players, ReplicatedStorage, Workspace
 do
     local ok
-    ok, Players          = pcall(game.GetService, game, "Players")
-    if not ok then error("Players: "          .. tostring(Players))          end
+    ok, Players           = pcall(game.GetService, game, "Players")
+    if not ok then error("Players: "           .. tostring(Players))           end
     ok, ReplicatedStorage = pcall(game.GetService, game, "ReplicatedStorage")
     if not ok then error("ReplicatedStorage: " .. tostring(ReplicatedStorage)) end
-    ok, Workspace        = pcall(game.GetService, game, "Workspace")
-    if not ok then error("Workspace: "        .. tostring(Workspace))        end
+    ok, Workspace         = pcall(game.GetService, game, "Workspace")
+    if not ok then error("Workspace: "         .. tostring(Workspace))         end
 end
 
 local LocalPlayer = Players.LocalPlayer
@@ -91,18 +95,19 @@ local CMD_LEAD          = 0.1
 -- КОНСТАНТЫ — GLADIATOR
 -- ═══════════════════════════════════════════════════════════════
 
-local GLAD_ABILITY_NAME = "Warrior's Call"
-local GLAD_TYPE         = "Gladiator"
-local GLAD_COOLDOWN     = 30.0
-local GLAD_STUN_RETRY   = 1.0   -- пауза перед повтором при стане (сек)
-local GLAD_MAX_RETRIES  = 15    -- максимум попыток при стане прежде чем пропустить
+local GLAD_ABILITY_NAME  = "Warrior's Call"
+local GLAD_TYPE          = "Gladiator"
+local GLAD_COOLDOWN      = 30.0
+local GLAD_MIN_LEVEL     = 3      -- способность доступна с 3 уровня
+local GLAD_STUN_RETRY    = 1.0   -- пауза перед повтором при стане (сек)
+local GLAD_MAX_RETRIES   = 15    -- максимум попыток при стане прежде чем пропустить
 
 -- ═══════════════════════════════════════════════════════════════
 -- ОБЩИЕ НАСТРОЙКИ
 -- ═══════════════════════════════════════════════════════════════
 
-local MAX_RETRIES = 10
-local debugMode   = false
+local CMD_MAX_RETRIES = 10
+local debugMode       = false
 
 -- ═══════════════════════════════════════════════════════════════
 -- СОСТОЯНИЕ — COMMANDER
@@ -125,8 +130,8 @@ local CmdState = {
 local GladState = {
     Enabled         = false,
     Gladiators      = {},
-    ScheduledThread = nil,
     ActivationCount = 0,
+    -- Потоки каждого гладиатора хранятся внутри самого объекта g.thread
 }
 
 -- ═══════════════════════════════════════════════════════════════
@@ -166,27 +171,25 @@ local function GetLevel(model)
     return ok and result or 0
 end
 
--- Проверка стана башни
--- Проверяем оба возможных атрибута которые TDS использует для стана
+-- Проверка стана — три варианта атрибута
 local function IsStunned(model)
     local ok, result = pcall(function()
         local rep = GetReplicator(model)
         if not rep then return false end
 
-        -- Вариант 1: булевый флаг Stunned
+        -- Вариант 1: булевый флаг
         local stunned = rep:GetAttribute("Stunned")
         if stunned == true then return true end
 
-        -- Вариант 2: числовой таймер StunTime (> 0 значит застанена)
+        -- Вариант 2: числовой таймер (значение = время окончания стана)
         local stunTime = rep:GetAttribute("StunTime")
         if type(stunTime) == "number" and stunTime > os.clock() then
             return true
         end
 
-        -- Вариант 3: статус башни через строку
+        -- Вариант 3: строковый статус
         local status = rep:GetAttribute("Status")
-        if type(status) == "string"
-        and status:lower():find("stun") then
+        if type(status) == "string" and status:lower():find("stun") then
             return true
         end
 
@@ -203,34 +206,27 @@ end
 -- СКАНИРОВАНИЕ
 -- ═══════════════════════════════════════════════════════════════
 
-local function ScanTowers(towerType)
+local function ScanCommanders()
     local found = {}
     local ok, err = pcall(function()
         for _, model in ipairs(TowersFolder:GetChildren()) do
             if model:IsA("Model")
             and IsOwned(model)
-            and GetType(model) == towerType
+            and GetType(model) == CMD_TYPE
             then
                 table.insert(found, {
                     model         = model,
                     name          = model.Name,
                     level         = GetLevel(model),
                     cooldownUntil = 0,
-                    retryCount    = 0,
                 })
             end
         end
     end)
     if not ok then
-        warn(string.format("[AutoChain] Ошибка сканирования (%s): %s",
-            towerType, tostring(err)))
+        warn("[Commander] Ошибка сканирования: " .. tostring(err))
     end
     table.sort(found, function(a, b) return a.level > b.level end)
-    return found
-end
-
-local function ScanCommanders()
-    local found = ScanTowers(CMD_TYPE)
     warn(string.format("[Commander] Найдено: %d", #found))
     for i, c in ipairs(found) do
         warn(string.format("  [%d] %s (ур.%d)", i, c.name, c.level))
@@ -243,10 +239,47 @@ local function ScanCommanders()
 end
 
 local function ScanGladiators()
-    local found = ScanTowers(GLAD_TYPE)
-    warn(string.format("[Gladiator] Найдено: %d", #found))
+    local found    = {}
+    local skipped  = 0
+    local ok, err  = pcall(function()
+        for _, model in ipairs(TowersFolder:GetChildren()) do
+            if model:IsA("Model")
+            and IsOwned(model)
+            and GetType(model) == GLAD_TYPE
+            then
+                local level = GetLevel(model)
+                if level >= GLAD_MIN_LEVEL then
+                    -- Каждый гладиатор — отдельная запись со своим потоком
+                    table.insert(found, {
+                        model         = model,
+                        name          = model.Name,
+                        level         = level,
+                        cooldownUntil = 0,
+                        retryCount    = 0,
+                        thread        = nil,  -- task.delay handle
+                    })
+                else
+                    skipped += 1
+                    DbgLog(string.format(
+                        "[Gladiator] Пропущен (ур.%d < %d): %s",
+                        level, GLAD_MIN_LEVEL, model.Name))
+                end
+            end
+        end
+    end)
+    if not ok then
+        warn("[Gladiator] Ошибка сканирования: " .. tostring(err))
+    end
+    table.sort(found, function(a, b) return a.level > b.level end)
+    warn(string.format("[Gladiator] Найдено: %d (пропущено низкоур.: %d)",
+        #found, skipped))
     for i, g in ipairs(found) do
         warn(string.format("  [%d] %s (ур.%d)", i, g.name, g.level))
+    end
+    if skipped > 0 then
+        warn(string.format(
+            "[Gladiator][INFO] %d башен ниже %d ур. — способность недоступна",
+            skipped, GLAD_MIN_LEVEL))
     end
     return found
 end
@@ -285,31 +318,38 @@ local function ActivateCommander(cmd)
         return false
     end
 
-    cmd.cooldownUntil = os.clock() + CMD_COOLDOWN
+    cmd.cooldownUntil         = os.clock() + CMD_COOLDOWN
     CmdState.ActivationCount += 1
-    CmdState.RetryCount = 0
+    CmdState.RetryCount       = 0
     warn(string.format("[Commander] ✓ %s (всего: %d)",
         cmd.name, CmdState.ActivationCount))
     return true
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- АКТИВАЦИЯ — GLADIATOR
+-- АКТИВАЦИЯ — GLADIATOR (одна башня)
 -- Возвращает: "ok" | "stun" | "cooldown" | "error" | "removed"
 -- ═══════════════════════════════════════════════════════════════
 
 local function ActivateGladiator(g)
+    -- Башня удалена с карты
     if not g.model or not g.model.Parent then
         return "removed"
     end
 
-    -- Проверяем стан до отправки запроса — экономим трафик
+    -- Уровень мог измениться — перепроверяем
+    if GetLevel(g.model) < GLAD_MIN_LEVEL then
+        DbgLog("[Gladiator] Уровень < " .. GLAD_MIN_LEVEL .. ": " .. g.name)
+        return "cooldown" -- ждём как будто на кулдауне
+    end
+
+    -- Проверяем стан ДО запроса — экономим трафик
     if IsStunned(g.model) then
         DbgLog("[Gladiator] Застанен: " .. g.name)
         return "stun"
     end
 
-    -- Проверяем кулдаун локально до запроса
+    -- Локальная проверка кулдауна
     local now = os.clock()
     if g.cooldownUntil > now then
         DbgLog(string.format("[Gladiator] КД %.1fс: %s",
@@ -332,7 +372,7 @@ local function ActivateGladiator(g)
         return "error"
     end
     if result == false then
-        -- Сервер отклонил — может быть стан на серверной стороне
+        -- Сервер отклонил — скорее всего стан на серверной стороне
         DbgLog("[Gladiator] Отклонено сервером: " .. g.name)
         return "stun"
     end
@@ -343,12 +383,91 @@ local function ActivateGladiator(g)
         if lower:find("error")    then return "error"    end
     end
 
-    g.cooldownUntil = os.clock() + GLAD_COOLDOWN
-    g.retryCount    = 0
+    g.cooldownUntil          = os.clock() + GLAD_COOLDOWN
+    g.retryCount             = 0
     GladState.ActivationCount += 1
     warn(string.format("[Gladiator] ✓ %s (всего: %d)",
         g.name, GladState.ActivationCount))
     return "ok"
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- GLADIATOR — ПОТОК ОДНОЙ БАШНИ
+--
+-- Каждая башня запускает свой рекурсивный task.delay поток.
+-- Потоки НЕ знают друг о друге и НЕ ждут друг друга.
+-- Если несколько башен готовы одновременно — они активируются
+-- параллельно с задержкой ~0мс (только latency сервера).
+-- ═══════════════════════════════════════════════════════════════
+
+local function GladLoop(g)
+    -- Стоп-флаг проверяется в начале каждой итерации
+    if not GladState.Enabled then return end
+
+    -- Башня удалена — поток тихо завершается
+    if not g.model or not g.model.Parent then
+        warn("[Gladiator] Поток завершён (башня удалена): " .. tostring(g.name))
+        return
+    end
+
+    local status = ActivateGladiator(g)
+
+    if status == "ok" then
+        -- ── Успех ──────────────────────────────────────────────
+        -- Следующая попытка ровно через кулдаун минус упреждение
+        local nextWait = GLAD_COOLDOWN - 0.3
+        DbgLog(string.format("[Gladiator] '%s' OK → следующий через %.1fс",
+            g.name, nextWait))
+        g.thread = task.delay(nextWait, function()
+            GladLoop(g)
+        end)
+
+    elseif status == "stun" then
+        -- ── Стан ───────────────────────────────────────────────
+        g.retryCount = (g.retryCount or 0) + 1
+
+        if g.retryCount >= GLAD_MAX_RETRIES then
+            -- Слишком долгий стан — делаем паузу на полный кулдаун
+            -- чтобы не спамить сервер бесполезными запросами
+            warn(string.format(
+                "[Gladiator][WARN] '%s' в стане %d попыток подряд → пауза %.0fс",
+                g.name, g.retryCount, GLAD_COOLDOWN))
+            g.retryCount = 0
+            g.thread = task.delay(GLAD_COOLDOWN, function()
+                GladLoop(g)
+            end)
+        else
+            DbgLog(string.format(
+                "[Gladiator] '%s' стан (попытка %d/%d) → повтор через %.1fс",
+                g.name, g.retryCount, GLAD_MAX_RETRIES, GLAD_STUN_RETRY))
+            g.thread = task.delay(GLAD_STUN_RETRY, function()
+                GladLoop(g)
+            end)
+        end
+
+    elseif status == "cooldown" then
+        -- ── Кулдаун ────────────────────────────────────────────
+        -- Ждём ровно сколько осталось + маленький запас
+        local remaining = math.max(0.5, g.cooldownUntil - os.clock())
+        DbgLog(string.format("[Gladiator] '%s' КД → ждём %.1fс",
+            g.name, remaining))
+        g.thread = task.delay(remaining, function()
+            GladLoop(g)
+        end)
+
+    elseif status == "removed" then
+        -- ── Башня удалена ──────────────────────────────────────
+        warn("[Gladiator] Поток завершён (removed): " .. tostring(g.name))
+        -- Поток просто завершается, не перезапускается
+
+    else
+        -- ── Ошибка сети / сервера ──────────────────────────────
+        warn(string.format("[Gladiator] Ошибка '%s' → повтор через 2с",
+            tostring(g.name)))
+        g.thread = task.delay(2, function()
+            GladLoop(g)
+        end)
+    end
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -380,10 +499,9 @@ local function CmdScheduleNext()
     local cmd = CmdState.Commanders[CmdState.QueueIndex]
     local now = os.clock()
 
-    local chainWait = CmdState.LastChainTime == 0
+    local chainWait    = CmdState.LastChainTime == 0
         and 0
         or (CmdState.LastChainTime + CMD_BUFF_DURATION - CMD_LEAD) - now
-
     local cooldownWait = cmd.cooldownUntil - now
     local waitTime     = math.max(0, chainWait, cooldownWait)
 
@@ -403,10 +521,10 @@ local function CmdScheduleNext()
                 CmdScheduleNext()
             else
                 CmdState.RetryCount += 1
-                if CmdState.RetryCount >= MAX_RETRIES then
+                if CmdState.RetryCount >= CMD_MAX_RETRIES then
                     warn(string.format(
                         "[Commander][WARN] %d неудач подряд, пропуск '%s'",
-                        MAX_RETRIES, cmd.name))
+                        CMD_MAX_RETRIES, cmd.name))
                     CmdState.RetryCount = 0
                     CmdState.QueueIndex = (CmdState.QueueIndex % #CmdState.Commanders) + 1
                 end
@@ -423,79 +541,6 @@ local function CmdScheduleNext()
             end)
         end
     end)
-end
-
--- ═══════════════════════════════════════════════════════════════
--- GLADIATOR ЦИКЛ
---
--- Логика на одну башню:
---   1. Проверяем стан → если застанена, ждём GLAD_STUN_RETRY и повторяем
---   2. Проверяем кулдаун → ждём точно сколько надо
---   3. Активируем → планируем следующий цикл через GLAD_COOLDOWN
---
--- Каждая башня работает в своём независимом task.delay потоке.
--- Нет общего цикла — нет блокировки при стане одной башни.
--- ═══════════════════════════════════════════════════════════════
-
-local function GladSchedule(g)
-    if not GladState.Enabled then return end
-
-    -- Башня удалена
-    if not g.model or not g.model.Parent then
-        warn("[Gladiator] Башня удалена из потока: " .. tostring(g.name))
-        return
-    end
-
-    local status = ActivateGladiator(g)
-
-    if status == "ok" then
-        -- Успех — следующая попытка ровно через кулдаун
-        g.retryCount = 0
-        DbgLog(string.format("[Gladiator] Следующий цикл '%s' через %.1fс",
-            g.name, GLAD_COOLDOWN - 0.5))
-        task.delay(GLAD_COOLDOWN - 0.5, function()
-            if GladState.Enabled then GladSchedule(g) end
-        end)
-
-    elseif status == "stun" then
-        -- Застанена — повторяем через GLAD_STUN_RETRY
-        g.retryCount = (g.retryCount or 0) + 1
-        if g.retryCount >= GLAD_MAX_RETRIES then
-            -- Слишком долго в стане — ждём полный кулдаун и пробуем заново
-            warn(string.format(
-                "[Gladiator][WARN] '%s' застанена %dс подряд, пауза %.0fс",
-                g.name, g.retryCount, GLAD_COOLDOWN))
-            g.retryCount = 0
-            task.delay(GLAD_COOLDOWN, function()
-                if GladState.Enabled then GladSchedule(g) end
-            end)
-        else
-            DbgLog(string.format("[Gladiator] '%s' стан, повтор через %.1fс (попытка %d)",
-                g.name, GLAD_STUN_RETRY, g.retryCount))
-            task.delay(GLAD_STUN_RETRY, function()
-                if GladState.Enabled then GladSchedule(g) end
-            end)
-        end
-
-    elseif status == "cooldown" then
-        -- Кулдаун — ждём точно сколько осталось
-        local wait = math.max(1, g.cooldownUntil - os.clock())
-        DbgLog(string.format("[Gladiator] '%s' КД, ждём %.1fс", g.name, wait))
-        task.delay(wait, function()
-            if GladState.Enabled then GladSchedule(g) end
-        end)
-
-    elseif status == "removed" then
-        warn("[Gladiator] Башня удалена: " .. tostring(g.name))
-        -- Поток завершается — больше не перезапускаем
-
-    else
-        -- "error" или неизвестный статус — повтор через 2с
-        warn(string.format("[Gladiator] Ошибка '%s', повтор через 2с", g.name))
-        task.delay(2, function()
-            if GladState.Enabled then GladSchedule(g) end
-        end)
-    end
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -541,31 +586,45 @@ local function StartGladiator()
     if GladState.Enabled then return false end
     GladState.Gladiators = ScanGladiators()
     if #GladState.Gladiators == 0 then
-        warn("[Gladiator] Башни не найдены!")
+        warn("[Gladiator] Башни не найдены (или все ниже " .. GLAD_MIN_LEVEL .. " ур.)!")
         return false
     end
     GladState.Enabled         = true
     GladState.ActivationCount = 0
+
     for _, g in ipairs(GladState.Gladiators) do
         g.cooldownUntil = 0
         g.retryCount    = 0
+        g.thread        = nil
     end
-    warn("[Gladiator] ▶ Запущен")
-    -- Запускаем независимый поток для каждой башни
-    -- Небольшой сдвиг (0.1с) чтобы не отправлять все запросы одновременно
+
+    warn(string.format("[Gladiator] ▶ Запуск %d независимых потоков",
+        #GladState.Gladiators))
+
+    -- Запускаем все потоки ОДНОВРЕМЕННО
+    -- task.delay(0) = следующий кадр, без блокировки текущего потока
+    -- Минимальный сдвиг 0.05с только чтобы не перегрузить сервер
+    -- в самый первый момент (потом они разойдутся по времени сами)
     for i, g in ipairs(GladState.Gladiators) do
-        local offset = (i - 1) * 0.15
-        task.delay(offset, function()
-            if GladState.Enabled then GladSchedule(g) end
+        local startOffset = (i - 1) * 0.05  -- 50мс между стартами
+        g.thread = task.delay(startOffset, function()
+            GladLoop(g)
         end)
     end
+
     return true
 end
 
 local function StopGladiator()
     if not GladState.Enabled then return end
     GladState.Enabled = false
-    -- Потоки завершатся сами при следующей проверке GladState.Enabled
+    -- Отменяем все запланированные потоки
+    for _, g in ipairs(GladState.Gladiators) do
+        if g.thread then
+            pcall(task.cancel, g.thread)
+            g.thread = nil
+        end
+    end
     warn(string.format("[Gladiator] ⏹ Остановлен. Активаций: %d",
         GladState.ActivationCount))
 end
@@ -593,9 +652,9 @@ if not Rayfield then return end
 local uiOk, uiErr = pcall(function()
 
     local Window = Rayfield:CreateWindow({
-        Name             = "AutoChain — TDS: S.O.L.A.R",
-        LoadingTitle     = "AutoChain v1.2",
-        LoadingSubtitle  = "Commander + Gladiator",
+        Name            = "AutoChain — TDS: S.O.L.A.R",
+        LoadingTitle    = "AutoChain v1.3",
+        LoadingSubtitle = "Commander + Gladiator",
         ConfigurationSaving = {
             Enabled  = true,
             FileName = "AutoChain_SOLAR"
@@ -603,7 +662,9 @@ local uiOk, uiErr = pcall(function()
         KeySystem = false,
     })
 
-    -- ── Главная вкладка ──────────────────────────────────────────
+    -- ════════════════════════════════════════════════════════════
+    -- ВКЛАДКА: AutoChain
+    -- ════════════════════════════════════════════════════════════
 
     local Main = Window:CreateTab("AutoChain", nil)
 
@@ -621,8 +682,9 @@ local uiOk, uiErr = pcall(function()
                 Rayfield:Notify({
                     Title    = "Commander",
                     Content  = started
-                        and string.format("Запущен! Командиров: %d", #CmdState.Commanders)
-                        or  "Командиры не найдены",
+                        and string.format("Запущен! Командиров: %d",
+                            #CmdState.Commanders)
+                        or "Командиры не найдены",
                     Duration = 4,
                 })
             else
@@ -645,7 +707,8 @@ local uiOk, uiErr = pcall(function()
             CmdState.Commanders = ScanCommanders()
             Rayfield:Notify({
                 Title    = "Сканирование",
-                Content  = string.format("Commander'ов: %d", #CmdState.Commanders),
+                Content  = string.format("Commander'ов: %d",
+                    #CmdState.Commanders),
                 Duration = 4,
             })
             if was and #CmdState.Commanders > 0 then StartCommander() end
@@ -698,8 +761,10 @@ local uiOk, uiErr = pcall(function()
                 Rayfield:Notify({
                     Title    = "Gladiator",
                     Content  = started
-                        and string.format("Запущен! Башен: %d", #GladState.Gladiators)
-                        or  "Gladiator'ы не найдены",
+                        and string.format("Запущен! Башен: %d",
+                            #GladState.Gladiators)
+                        or string.format(
+                            "Не найдены (нужен ур.%d+)", GLAD_MIN_LEVEL),
                     Duration = 4,
                 })
             else
@@ -719,15 +784,17 @@ local uiOk, uiErr = pcall(function()
         Callback = function()
             local was = GladState.Enabled
             if was then StopGladiator() end
-            -- Небольшая пауза чтобы потоки успели остановиться
             task.delay(0.3, function()
                 GladState.Gladiators = ScanGladiators()
                 Rayfield:Notify({
                     Title    = "Сканирование",
-                    Content  = string.format("Gladiator'ов: %d", #GladState.Gladiators),
+                    Content  = string.format("Gladiator'ов (ур.%d+): %d",
+                        GLAD_MIN_LEVEL, #GladState.Gladiators),
                     Duration = 4,
                 })
-                if was and #GladState.Gladiators > 0 then StartGladiator() end
+                if was and #GladState.Gladiators > 0 then
+                    StartGladiator()
+                end
             end)
         end,
     })
@@ -754,7 +821,9 @@ local uiOk, uiErr = pcall(function()
         Callback     = function(v) GLAD_STUN_RETRY = v end,
     })
 
-    -- ── Отладка ──────────────────────────────────────────────────
+    -- ════════════════════════════════════════════════════════════
+    -- ВКЛАДКА: Отладка
+    -- ════════════════════════════════════════════════════════════
 
     local Debug = Window:CreateTab("Отладка", nil)
 
@@ -775,7 +844,8 @@ local uiOk, uiErr = pcall(function()
                 CmdState.ActivationCount))
             for i, cmd in ipairs(CmdState.Commanders) do
                 warn(string.format("  [%d]%s %s (ур.%d) | КД: %.1fс",
-                    i, i == CmdState.QueueIndex and ">" or " ",
+                    i,
+                    i == CmdState.QueueIndex and ">" or " ",
                     cmd.name, cmd.level,
                     math.max(0, cmd.cooldownUntil - now)))
             end
@@ -798,15 +868,15 @@ local uiOk, uiErr = pcall(function()
         Callback = function()
             local now = os.clock()
             warn("[Gladiator] ═══ Статус ═══")
-            warn(string.format("  %s | Активаций: %d",
+            warn(string.format("  %s | Активаций: %d | Потоков: %d",
                 GladState.Enabled and "АКТИВЕН" or "СТОП",
-                GladState.ActivationCount))
+                GladState.ActivationCount,
+                #GladState.Gladiators))
             for i, g in ipairs(GladState.Gladiators) do
-                local stunned = IsStunned(g.model) and "⚡СТАН" or "OK"
-                warn(string.format("  [%d] %s (ур.%d) | КД: %.1fс | %s",
-                    i, g.name, g.level,
-                    math.max(0, g.cooldownUntil - now),
-                    stunned))
+                local cd      = math.max(0, g.cooldownUntil - now)
+                local stunStr = IsStunned(g.model) and " ⚡СТАН" or ""
+                warn(string.format("  [%d] %s (ур.%d) | КД: %.1fс%s",
+                    i, g.name, g.level, cd, stunStr))
             end
             warn("[Gladiator] ═════════════")
             Rayfield:Notify({
@@ -823,16 +893,14 @@ local uiOk, uiErr = pcall(function()
             local cmdCount  = 0
             local gladCount = 0
 
-            -- Тест Commander'ов
             for _, cmd in ipairs(CmdState.Commanders) do
                 if ActivateCommander(cmd) then cmdCount += 1 end
                 task.wait(0.2)
             end
 
-            -- Тест Gladiator'ов
             for _, g in ipairs(GladState.Gladiators) do
                 if ActivateGladiator(g) == "ok" then gladCount += 1 end
-                task.wait(0.2)
+                task.wait(0.15)
             end
 
             Rayfield:Notify({
@@ -845,7 +913,9 @@ local uiOk, uiErr = pcall(function()
         end,
     })
 
-    -- ── Помощь ───────────────────────────────────────────────────
+    -- ════════════════════════════════════════════════════════════
+    -- ВКЛАДКА: Помощь
+    -- ════════════════════════════════════════════════════════════
 
     local Help = Window:CreateTab("Помощь", nil)
 
@@ -859,15 +929,18 @@ local uiOk, uiErr = pcall(function()
     Help:CreateLabel("5 CMD: 5×10=50с → 100% покрытие")
     Help:CreateLabel("4 CMD: 4×10=40с → разрыв 10с")
 
-    Help:CreateSection("Gladiator — стан")
+    Help:CreateSection("Gladiator — важно")
+    Help:CreateLabel("Способность доступна с 3 уровня")
+    Help:CreateLabel("Каждая башня — отдельный поток")
+    Help:CreateLabel("Все активируются параллельно")
     Help:CreateLabel("При стане: повтор каждые N сек")
-    Help:CreateLabel("Настрой 'Повтор при стане' под волну")
-    Help:CreateLabel("После 15 попыток — пауза 30с")
+    Help:CreateLabel("После 15 попыток стана → пауза 30с")
 
-    Help:CreateSection("Если способность не активируется")
-    Help:CreateLabel("• Проверь Output (F9) с включённым логом")
-    Help:CreateLabel("• Нажми Пересканировать после установки башен")
-    Help:CreateLabel("• Убедись что башни твои (не союзника)")
+    Help:CreateSection("Если не активируется")
+    Help:CreateLabel("• Включи Подробный лог → F9")
+    Help:CreateLabel("• Нажми Пересканировать после постройки")
+    Help:CreateLabel("• Убедись что башни твои, а не союзника")
+    Help:CreateLabel("• Проверь что Gladiator ур.3+")
 
 end)
 
@@ -886,7 +959,7 @@ Players.PlayerRemoving:Connect(function(p)
     end
 end)
 
-warn("[AutoChain] S.O.L.A.R v1.2 загружен ✓")
+warn("[AutoChain] S.O.L.A.R v1.3 загружен ✓")
 
 end -- SafeInit
 
