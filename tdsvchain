@@ -95,8 +95,8 @@ local GLAD_ABILITY_NAME   = "Warrior's Call"
 local GLAD_TYPE           = "Gladiator"
 local GLAD_COOLDOWN       = 30.1
 local GLAD_MIN_LEVEL      = 3
-local GLAD_ACTIVATE_DELAY = 1.1
-local GLAD_STUN_RETRY     = 1.1
+local GLAD_ACTIVATE_DELAY = 1.3
+local GLAD_STUN_RETRY     = 2
 local GLAD_MAX_RETRIES    = 10
 
 -- ═══════════════════════════════════════════════════════════════
