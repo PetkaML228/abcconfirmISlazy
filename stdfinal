@@ -1,0 +1,3217 @@
+-- Slop Tower Defense / Fluent Hub V2
+-- Remotes и координаты: baseline пользователя; реальный Roblox/Delta здесь не проверен.
+-- Первый запуск V2 после V1: полностью переподключитесь к серверу.
+-- Хук не читает ответы сервера: запись содержит попытки вызовов, а не доказанные покупки.
+-- Внутри hook: только снимок аргументов/кэшированных данных. Никаких Roblox :методов.
+-- Исходный вызов выполняется РОВНО ОДИН РАЗ: return previous(self, ...).
+-- Запись: Start -> ручные Spawn/Upgrade -> Stop -> дождаться очереди -> Save.
+-- Play: свежий матч, та же карта и набор башен. Порог = Cash ДО ручного вызова.
+-- Макросы: SlopTowerDefenseHub/macros/*.json. Удаление: копия в trash + удаление оригинала.
+-- Auto Leave имеет приоритет над Replay; один запрос на показ EndScreen.
+-- После смены Place запустите файл снова. queue_on_teleport не устанавливается.
+-- AntiMacro оставлен в исходной опциональной схеме; протокол не подтверждён.
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local WS = game:GetService("Workspace")
+local Http = game:GetService("HttpService")
+local VU = game:GetService("VirtualUser")
+local LP = Players.LocalPlayer
+assert(LP, "Запустите скрипт после входа в игру")
+assert(type(loadstring) == "function", "Нет loadstring")
+local G = (type(getgenv) == "function" and getgenv()) or _G
+local ROOT = "SlopTowerDefenseHub"
+local LIMIT = { Steps = 5000, Bytes = 4 * 1024 * 1024, Nodes = 50000, Depth = 16 }
+local MAPS = {
+    "Area 51", "Base", "BrainrotEndless", "Cooking Stove", "Crossroads", "Desert",
+    "Doomspire", "Dungeon", "FairyEndless", "GardenEndless", "Gold Base", "Happy Home",
+    "Kitchen Table", "KitchenEndless", "Level 1", "Level 2", "Level 3", "Night Base",
+    "NightPlot", "Plot", "Raid", "RetroEndless", "RichPlot", "Ruined City",
+    "SpaceEndless", "Summer Raid", "SummerEndless", "The Fridge", "Toilet City", "ToiletEndless",
+    "Level0", "Level94", "BackroomsEndless", "Poolrooms",
+}
+local ELEVATORS = { "Elevator1", "Elevator2", "Elevator3", "Elevator4", "Elevator5", "Elevator6" }
+local ELEVATOR_POS = {
+    Elevator6 = Vector3.new(-11, 61, 100),
+    Elevator1 = Vector3.new(-10, 70.5, 142),
+}
+
+local function finite(v)
+    return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+end
+local function safeName(v)
+    return type(v) == "string" and #v >= 1 and #v <= 64 and v:match("^[%w_%-]+$") ~= nil
+end
+local function array(t, maximum)
+    assert(type(t) == "table", "Ожидался массив")
+    local n, count = #t, 0
+    assert(n <= maximum, "Слишком большой массив")
+    for k in pairs(t) do
+        assert(type(k) == "number" and k % 1 == 0 and k >= 1 and k <= n, "Повреждён массив")
+        count = count + 1
+    end
+    assert(count == n, "Пропуски в массиве")
+    return n
+end
+local function budget(b, depth)
+    b.n = b.n + 1
+    assert(depth <= LIMIT.Depth and b.n <= LIMIT.Nodes, "Превышен лимит сериализации")
+end
+local function encode(v, b, depth, seen)
+    b, depth, seen = b or { n = 0 }, depth or 0, seen or {}
+    budget(b, depth)
+    local ty = typeof(v)
+    if ty == "nil" then return { t = "nil" } end
+    if ty == "boolean" or ty == "string" then return { t = ty, v = v } end
+    if ty == "number" then assert(finite(v), "Неконечное число"); return { t = ty, v = v } end
+    if ty == "CFrame" then return { t = "CFrame", v = { v:GetComponents() } } end
+    if ty == "Vector3" then return { t = "Vector3", v = { v.X, v.Y, v.Z } } end
+    if ty == "Vector2" then return { t = "Vector2", v = { v.X, v.Y } } end
+    assert(ty == "table", "Неподдерживаемый аргумент: " .. ty)
+    assert(not seen[v], "Циклическая таблица")
+    seen[v] = true
+    local entries = {}
+    for k, value in next, v do
+        assert(type(k) == "string" or type(k) == "number" or type(k) == "boolean", "Неверный ключ")
+        entries[#entries + 1] = { encode(k, b, depth + 1, seen), encode(value, b, depth + 1, seen) }
+    end
+    seen[v] = nil
+    return { t = "table", v = entries }
+end
+local function decode(node, b, depth)
+    b, depth = b or { n = 0 }, depth or 0
+    budget(b, depth)
+    assert(type(node) == "table" and type(node.t) == "string", "Повреждён аргумент")
+    local t, v = node.t, node.v
+    if t == "nil" then return nil end
+    if t == "string" or t == "boolean" then assert(type(v) == t, "Неверный тип"); return v end
+    if t == "number" then assert(finite(v), "Неверное число"); return v end
+    if t == "CFrame" or t == "Vector3" or t == "Vector2" then
+        local n = t == "CFrame" and 12 or (t == "Vector3" and 3 or 2)
+        assert(array(v, n) == n, "Неверная размерность")
+        for _, x in ipairs(v) do assert(finite(x), "Неверная координата") end
+        if t == "CFrame" then return CFrame.new(table.unpack(v)) end
+        if t == "Vector3" then return Vector3.new(table.unpack(v)) end
+        return Vector2.new(table.unpack(v))
+    end
+    assert(t == "table", "Неизвестный тип")
+    array(v, LIMIT.Nodes)
+    local out = {}
+    for _, pair in ipairs(v) do
+        assert(array(pair, 2) == 2, "Неверная пара")
+        local k = decode(pair[1], b, depth + 1)
+        local value = decode(pair[2], b, depth + 1)
+        assert(type(k) == "string" or type(k) == "number" or type(k) == "boolean", "Неверный ключ")
+        assert(value ~= nil and out[k] == nil, "Повторный ключ или nil")
+        out[k] = value
+    end
+    return out
+end
+local function encodeArgs(args)
+    local out, b = {}, { n = 0 }
+    for i = 1, args.n do out[i] = encode(args[i], b) end
+    return out
+end
+local function decodeArgs(args)
+    local out, b = { n = #args }, { n = 0 }
+    for i = 1, #args do out[i] = decode(args[i], b) end
+    return out
+end
+local function validateMacro(data)
+    assert(type(data) == "table" and data.format == "STD-MONEY" and data.version == 2,
+        "Ожидался STD-MONEY версии 2. Макрос v1 (попытки) устарел: перезапишите запись")
+    assert(finite(data.placeId) and finite(data.gameId), "Нет идентификатора игры")
+    array(data.steps, LIMIT.Steps)
+    local ids = {}
+    for i, s in ipairs(data.steps) do
+        assert(type(s) == "table" and finite(s.cash) and s.cash >= 0, "Неверный Cash: " .. i)
+        assert(type(s.id) == "string" and #s.id <= 40 and s.id:match("^T%d+$"), "Неверный ID")
+        if s.kind == "Spawn" then
+            assert(not ids[s.id], "Повторный Spawn ID")
+            assert(array(s.args, 5) == 5, "Spawn: нужно 5 аргументов")
+            local a = decodeArgs(s.args)
+            assert(type(a[1]) == "string" and #a[1] > 0 and typeof(a[2]) == "CFrame"
+                and type(a[3]) == "boolean" and type(a[4]) == "string" and type(a[5]) == "table",
+                "Неожиданная сигнатура SpawnTower")
+            ids[s.id] = true
+        elseif s.kind == "Upgrade" then
+            assert(ids[s.id], "Upgrade без записанного Spawn: " .. s.id)
+            assert(type(s.name) == "string" and #s.name > 0, "Нет имени UpgradeTower")
+        elseif s.kind == "Target" then
+            assert(ids[s.id], "Target без записанного Spawn: " .. s.id)
+            if s.mode ~= nil then
+                assert(s.mode == "First" or s.mode == "Last" or s.mode == "Near"
+                    or s.mode == "Strong" or s.mode == "Weak", "Неверный TargetMode: " .. i)
+            end
+        else error("Неизвестное действие: " .. tostring(s.kind)) end
+    end
+    return data
+end
+local function emptyMacro()
+    return { format = "STD-MONEY", version = 2, placeId = game.PlaceId,
+        gameId = game.GameId, recordingMode = "confirmed-only", steps = {} }
+end
+
+-- V1 уже мог испортить цепочку __namecall. Не пытаемся снимать чужие hooks.
+local legacy = G.__STD_NAMECALL_V1
+assert(not (type(legacy) == "table" and legacy.installed),
+    "Обнаружен hook V1. Полностью переподключитесь к серверу и запустите только V2")
+local oldHub = G.__STD_HUB_V2 or G.__STD_HUB_V1
+if type(oldHub) == "table" and type(oldHub.Destroy) == "function" then
+    local old = oldHub.State
+    assert(not old or (not old.pumping and (old.pending or 0) == 0 and not next(old.locks or {})),
+        "Предыдущий хаб ещё занят; дождитесь завершения или переподключитесь")
+    oldHub.Destroy("Повторный запуск")
+end
+local okUI, Fluent = pcall(function()
+    return loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+end)
+assert(okUI and type(Fluent) == "table", "Не удалось загрузить Fluent: " .. tostring(Fluent))
+local S = {
+    alive = true, recording = false, playing = false, pumping = false,
+    playEpoch = 0, recordEpoch = 0, pending = 0, cursor = 1, nextId = 0,
+    entries = {}, recRefs = {}, recOwners = {}, playRefs = {}, rawQueue = {},
+    queueHead = 1, queueTail = 0, drainScheduled = false, recordCalls = 0,
+    cash = nil, cashVersion = 0, connections = {}, locks = {}, workers = {},
+    towerSet = {}, towerFolder = nil, recordEnabled = false,
+    macro = emptyMacro(), lastError = "Нет", antiStatus = "Ожидание Check",
+    lastElevator = -math.huge,
+}
+local hub = { State = S }
+G.__STD_HUB_V2 = hub
+local options = Fluent.Options
+local function opt(id, fallback)
+    local item = options[id]
+    if item and item.Value ~= nil then return item.Value end
+    return fallback
+end
+local function notify(message)
+    if S.alive and not Fluent.Unloaded then
+        pcall(function() Fluent:Notify({ Title = "Slop TD Hub V2", Content = tostring(message), Duration = 6 }) end)
+    end
+end
+local notices = {}
+local function problem(key, message)
+    S.lastError = tostring(message)
+    local now = os.clock()
+    if not notices[key] or now - notices[key] > 12 then
+        notices[key] = now
+        warn("[Slop TD Hub] " .. tostring(message))
+        notify(message)
+    end
+end
+local function connect(signal, callback)
+    local c = signal:Connect(callback)
+    S.connections[#S.connections + 1] = c
+    return c
+end
+local function remote(group, name, class)
+    local folder = RS:FindFirstChild(group)
+    local r = folder and folder:FindFirstChild(name)
+    return r and r:IsA(class) and r or nil
+end
+local function fire(group, name, ...)
+    local r = remote(group, name, "RemoteEvent")
+    if not r then return false, "Нет " .. group .. "." .. name end
+    return pcall(r.FireServer, r, ...)
+end
+local function towers() return WS:FindFirstChild("Towers") end
+local function towerModel(obj)
+    local folder = towers()
+    if not folder or typeof(obj) ~= "Instance" then return nil end
+    while obj and obj.Parent ~= folder do obj = obj.Parent end
+    return obj and obj:IsA("Model") and obj or nil
+end
+local function pivot(model)
+    if not model then return nil end
+    local ok, cf = pcall(model.GetPivot, model)
+    return ok and cf or nil
+end
+local function snapshotTowers()
+    local set, folder = {}, towers()
+    if folder then for _, child in ipairs(folder:GetChildren()) do set[child] = true end end
+    return set
+end
+local function nearestNew(cf, before, tolerance)
+    local folder, found = towers(), nil
+    if not folder then return nil end
+    for _, child in ipairs(folder:GetChildren()) do
+        if child:IsA("Model") and not before[child] then
+            local p = pivot(child)
+            if p and (p.Position - cf.Position).Magnitude <= tolerance then
+                if found then return nil, "Неоднозначная позиция башни" end
+                found = child
+            end
+        end
+    end
+    return found
+end
+local function fingerprint(model)
+    if not model or not model.Parent then return "removed" end
+    local fields = {}
+    for k, v in pairs(model:GetAttributes()) do fields[#fields + 1] = "A:" .. k .. ":" .. tostring(v) end
+    for _, obj in ipairs(model:GetDescendants()) do
+        if obj:IsA("NumberValue") or obj:IsA("IntValue") or obj:IsA("StringValue") or obj:IsA("BoolValue") then
+            fields[#fields + 1] = obj:GetFullName() .. ":" .. tostring(obj.Value)
+        end
+    end
+    table.sort(fields)
+    return table.concat(fields, "|")
+end
+local function refreshCash()
+    local value = LP:FindFirstChild("Cash")
+    if value and not (value:IsA("IntValue") or value:IsA("NumberValue")) then value = nil end
+    if value ~= S.cash then
+        if S.cashConnection then S.cashConnection:Disconnect() end
+        S.cash, S.cashConnection = value, nil
+        S.cashVersion = S.cashVersion + 1
+        if value then
+            S.cashConnection = value:GetPropertyChangedSignal("Value"):Connect(function()
+                S.cashVersion = S.cashVersion + 1
+                if hub.Pump then hub.Pump() end
+            end)
+        end
+    end
+end
+local function cashNow()
+    refreshCash()
+    return S.cash and S.cash.Value or nil
+end
+local function waitUntil(predicate, seconds, valid)
+    local deadline = os.clock() + seconds
+    repeat
+        if not S.alive or (valid and not valid()) then return nil, "Остановлено" end
+        local result, detail = predicate()
+        if result then return result, detail end
+        if detail then return nil, detail end
+        task.wait(0.05)
+    until os.clock() >= deadline
+    return nil, "Истёк срок подтверждения"
+end
+
+local dispatcher = G.__STD_NAMECALL_V2
+local internal = setmetatable({}, { __mode = "k" })
+local function refreshRecordCache()
+    -- Все Roblox-методы выполняются ВНЕ hook.
+    S.spawnRemote = remote("Functions", "SpawnTower", "RemoteFunction")
+    S.upgradeRemote = remote("Functions", "UpgradeTower", "RemoteFunction")
+    S.modeRemote = remote("Functions", "ChangeTowerMode", "RemoteFunction")
+    if dispatcher then
+        dispatcher.spawnRemote, dispatcher.upgradeRemote = S.spawnRemote, S.upgradeRemote
+        dispatcher.modeRemote = S.modeRemote
+    end
+    local folder = towers()
+    if folder ~= S.towerFolder then
+        if S.towerAdded then S.towerAdded:Disconnect() end
+        if S.towerRemoved then S.towerRemoved:Disconnect() end
+        S.towerFolder, S.towerSet = folder, {}
+        if folder then
+            S.towerAdded = folder.ChildAdded:Connect(function(child) S.towerSet[child] = true end)
+            S.towerRemoved = folder.ChildRemoved:Connect(function(child) S.towerSet[child] = nil end)
+            S.towerSet = snapshotTowers()
+        end
+    end
+end
+
+-- BEGIN RAW SNAPSHOT: без Roblox :методов, сериализации CFrame и пользовательских metamethods.
+local function copyRaw(v, b, depth, seen)
+    budget(b, depth)
+    if type(v) == "string" then
+        b.bytes = b.bytes + #v
+        assert(b.bytes <= LIMIT.Bytes, "Слишком большой снимок аргументов")
+    end
+    if type(v) ~= "table" then return v end
+    assert(getmetatable(v) == nil, "Таблица с metatable не поддерживается записью")
+    assert(not seen[v], "Циклический аргумент")
+    seen[v] = true
+    local out = {}
+    for k, value in next, v do
+        assert(type(k) == "string" or type(k) == "number" or type(k) == "boolean", "Неверный ключ")
+        out[copyRaw(k, b, depth + 1, seen)] = copyRaw(value, b, depth + 1, seen)
+    end
+    seen[v] = nil
+    return out
+end
+local function captureCall(r, args, results)
+    if not S.alive or not S.recording or internal[coroutine.running()] then return end
+    -- Учитываем только подтверждённые сервером действия; отказ в запись не попадает.
+    local kind = (r == S.spawnRemote and "Spawn") or (r == S.modeRemote and "Target") or "Upgrade"
+    local first = results and results[1]
+    local confirmed = (kind == "Target" and first == true)
+        or (kind ~= "Target" and typeof(first) == "Instance")
+    if not confirmed then
+        S.recordSkipped = (S.recordSkipped or 0) + 1
+        return
+    end
+    assert(S.recordCalls < LIMIT.Steps, "Достигнут лимит шагов")
+    local money = S.cash and S.cash.Value -- только чтение свойства кэшированного Instance
+    assert(finite(money) and money >= 0, "Cash недоступен")
+    local copied = { n = args.n }
+    local b = { n = 0, bytes = 0 }
+    for i = 1, args.n do copied[i] = copyRaw(args[i], b, 0, {}) end
+    local before = {}
+    if kind == "Spawn" then
+        for model in next, S.towerSet do before[model] = true end
+    end
+    S.recordCalls = S.recordCalls + 1
+    S.queueTail = S.queueTail + 1
+    S.rawQueue[S.queueTail] = {
+        kind = kind, args = copied, cash = money, before = before, epoch = S.recordEpoch,
+    }
+    S.pending = S.pending + 1
+    if not S.drainScheduled then
+        S.drainScheduled = true
+        task.defer(hub.DrainRecording)
+    end
+end
+-- END RAW SNAPSHOT
+
+-- BEGIN TRANSPARENT HOOK
+local function installHook()
+    if type(dispatcher) == "table" and dispatcher.installed and dispatcher.protocol == "raw-direct-v2" then
+        S.recordEnabled = true
+        return true
+    end
+    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
+        return false, "Нужны hookmetamethod и getnamecallmethod"
+    end
+    local d = { protocol = "raw-direct-v2", installed = false }
+    local previous
+    local ok, err = pcall(function()
+        previous = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            local capture = d.capture
+            local watched = capture and method == "InvokeServer"
+                and (self == d.spawnRemote or self == d.upgradeRemote or self == d.modeRemote)
+            -- Аргументы упаковываем до вызова; сам вызов ниже — ровно один раз как раньше.
+            local argPack = watched and table.pack(...) or nil
+            -- Исходный вызов выполняется РОВНО ОДИН РАЗ: без pcall, без ':', args нетронуты.
+            local retPack = table.pack(previous(self, ...))
+            if watched then
+                -- Защищён ТОЛЬКО наблюдатель. Ответ уже известен, очередь — только для успеха.
+                local good, failure = pcall(capture, self, argPack, retPack)
+                if not good then
+                    d.capture = nil
+                    d.fault = tostring(failure) -- UI покажет ошибку позже, вне hook.
+                end
+            end
+            -- Возвращаем исходный tuple полностью, включая nil.
+            return table.unpack(retPack, 1, retPack.n)
+
+        end)
+        assert(type(previous) == "function", "hookmetamethod не вернул исходную функцию")
+    end)
+    if not ok then return false, tostring(err) end
+    d.installed, dispatcher = true, d
+    G.__STD_NAMECALL_V2 = d
+    S.recordEnabled = true
+    refreshRecordCache()
+    return true
+end
+-- END TRANSPARENT HOOK
+
+local function recordingError(message)
+    S.recording, S.recordBroken = false, true
+    problem("record", "Запись остановлена: " .. tostring(message))
+end
+local function findRecordedId(model)
+    local known = S.recRefs[model]
+    if known then return known end
+    local p = pivot(model)
+    assert(p, "Нет позиции прокачиваемой башни")
+    local found
+    for _, step in ipairs(S.entries) do
+        if step.kind == "Spawn" then
+            local cf = decode(step.args[2])
+            local owner = S.recOwners[step.id]
+            if (cf.Position - p.Position).Magnitude <= 0.8
+                and (not owner or owner == model or not owner.Parent) then
+                assert(not found, "Несколько записанных башен в одной позиции")
+                found = step.id
+            end
+        end
+    end
+    assert(found, "Башня отсутствует в записи; начните запись до Spawn")
+    S.recRefs[model], S.recOwners[found] = found, model
+    return found
+end
+local function processSnapshot(raw)
+    local a, step = raw.args, nil
+    if raw.kind == "Spawn" then
+        assert(a.n == 5 and type(a[1]) == "string" and #a[1] > 0 and typeof(a[2]) == "CFrame"
+            and type(a[3]) == "boolean" and type(a[4]) == "string" and type(a[5]) == "table",
+            "SpawnTower: сигнатура отличается от baseline")
+        local encoded = encodeArgs(a) -- здесь можно вызывать CFrame:GetComponents().
+        S.nextId = S.nextId + 1
+        step = { kind = "Spawn", id = "T" .. S.nextId, cash = raw.cash, args = encoded }
+        local model = nearestNew(a[2], raw.before, 0.8)
+        if model then S.recRefs[model], S.recOwners[step.id] = step.id, model end
+    elseif raw.kind == "Target" then
+        assert(a.n == 1, "ChangeTowerMode: другая сигнатура")
+        local target = towerModel(a[1])
+        assert(target, "Аргумент ChangeTowerMode больше не является доступной башней")
+        step = { kind = "Target", id = findRecordedId(target), cash = raw.cash }
+    else
+        assert(a.n == 2 and type(a[2]) == "string" and #a[2] > 0, "UpgradeTower: другая сигнатура")
+        local target = towerModel(a[1])
+        assert(target, "Аргумент UpgradeTower больше не является доступной башней")
+        step = { kind = "Upgrade", id = findRecordedId(target), cash = raw.cash, name = a[2] }
+    end
+    S.entries[#S.entries + 1] = step
+end
+function hub.DrainRecording()
+    -- Один FIFO consumer; отложенные данные не зависят от флага recording после Stop.
+    local failed = false
+    while S.queueHead <= S.queueTail do
+        local raw = S.rawQueue[S.queueHead]
+        S.rawQueue[S.queueHead] = nil
+        S.queueHead = S.queueHead + 1
+        S.pending = math.max(0, S.pending - 1)
+        if not failed and S.alive and raw and raw.epoch == S.recordEpoch then
+            local ok, err = pcall(processSnapshot, raw)
+            if not ok then
+                failed = true
+                recordingError(err)
+            end
+        end
+    end
+    S.queueHead, S.queueTail, S.drainScheduled = 1, 0, false
+end
+
+-- Только СОБСТВЕННЫЕ InvokeServer хаба используют pcall и timeout.
+local function invoke(key, r, args, valid)
+    if S.locks[key] then return nil, "Предыдущий запрос ещё выполняется: " .. key end
+    local ticket = { done = false }
+    S.locks[key] = ticket
+    task.spawn(function()
+        local thread = coroutine.running()
+        internal[thread] = true
+        ticket.result = table.pack(pcall(function() return r:InvokeServer(table.unpack(args, 1, args.n)) end))
+        internal[thread] = nil
+        ticket.done = true
+        if S.locks[key] == ticket then S.locks[key] = nil end
+    end)
+    local ready, err = waitUntil(function() return ticket.done end, 12, valid)
+    if not ready then return nil, err .. "; запрос нельзя безопасно повторить" end
+    if not ticket.result[1] then return nil, "Ошибка InvokeServer: " .. tostring(ticket.result[2]) end
+    if ticket.result[2] == false then return nil, "Сервер вернул false" end
+    return ticket.result
+end
+local function stopPlayback(message)
+    S.playing = false
+    S.playEpoch = S.playEpoch + 1
+    if message then notify(message) end
+end
+local function idleRequired()
+    assert(not S.recording and not S.playing and not S.pumping and S.pending == 0
+        and not S.drainScheduled and not S.locks.tower, "Остановите операцию и дождитесь очереди/запроса")
+end
+local function currentMacro()
+    assert(S.pending == 0 and not S.drainScheduled, "Дождитесь обработки очереди записи")
+    assert(not S.recordBroken and not (dispatcher and dispatcher.fault),
+        "Запись неполная из-за ошибки. Начните новую запись или загрузите файл")
+    if #S.entries == 0 then return validateMacro(S.macro) end
+    local data = emptyMacro()
+    data.steps = S.entries
+    return validateMacro(data)
+end
+local function confirmStep(step, response, before, target, priorFingerprint, valid)
+    local returned = towerModel(response[2])
+    local position = step.kind == "Spawn" and decode(step.args[2]) or S.playRefs[step.id].cf
+    local model, err = waitUntil(function()
+        if returned and returned.Parent == towers() and not before[returned] then return returned end
+        local replacement, ambiguous = nearestNew(position, before, 0.8)
+        if ambiguous then return nil, ambiguous end
+        if replacement then return replacement end
+        if step.kind == "Upgrade" and target and target.Parent == towers() then
+            if response[2] == true or fingerprint(target) ~= priorFingerprint then return target end
+        end
+        return nil
+    end, 8, valid)
+    if not model then return nil, err .. ": нет подтверждённой башни/прокачки" end
+    S.playRefs[step.id] = { model = model, cf = pivot(model) or position }
+    return true
+end
+local function playStep(step, valid)
+    local r = remote("Functions", step.kind == "Spawn" and "SpawnTower" or "UpgradeTower", "RemoteFunction")
+    if not r then return nil, "RemoteFunction отсутствует" end
+    local args, target, previousFingerprint
+    if step.kind == "Spawn" then
+        args = decodeArgs(step.args)
+    else
+        local ref = S.playRefs[step.id]
+        target = ref and ref.model
+        if not target or target.Parent ~= towers() then return nil, "Потеряна башня " .. step.id end
+        args = table.pack(target, step.name)
+        previousFingerprint = fingerprint(target)
+    end
+    local before, money = snapshotTowers(), cashNow()
+    if not finite(money) or money < step.cash then return nil, "Баланс изменился до отправки" end
+    local revision = S.cashVersion
+    if not valid() then return nil, "Остановлено" end
+    local result, err = invoke("tower", r, args, valid)
+    if not result then return nil, err end
+    local confirmed, confirmError = confirmStep(step, result, before, target, previousFingerprint, valid)
+    if not confirmed then return nil, confirmError end
+    if opt("WaitCashSync", true) and money > 0 and S.cashVersion == revision then
+        local updated = waitUntil(function() return S.cashVersion ~= revision end, 8, valid)
+        if not updated then return nil, "Cash не обновился; остановка без повтора" end
+    end
+    return true
+end
+function hub.Pump()
+    if not S.alive or not S.playing or S.pumping then return end
+    S.pumping = true
+    local epoch = S.playEpoch
+    local function valid() return S.alive and S.playing and S.playEpoch == epoch end
+    task.spawn(function()
+        local ok, err = pcall(function()
+            while valid() do
+                local step = S.macro.steps[S.cursor]
+                if not step then stopPlayback("Макрос завершён"); return end
+                local money = cashNow()
+                if not finite(money) or money < step.cash then return end
+                local done, message = playStep(step, valid)
+                if not done then
+                    if valid() then
+                        stopPlayback()
+                        problem("play", "Шаг " .. S.cursor .. ": " .. tostring(message))
+                    end
+                    return
+                end
+                if not valid() then return end
+                S.cursor = S.cursor + 1
+            end
+        end)
+        S.pumping = false
+        if not ok and valid() then stopPlayback(); problem("play", err) end
+    end)
+end
+local function resetMemory()
+    S.recordEpoch = S.recordEpoch + 1
+    S.entries, S.recRefs, S.recOwners, S.playRefs = {}, {}, {}, {}
+    S.nextId, S.cursor, S.recordCalls, S.recordBroken = 0, 1, 0, false
+    S.recordSkipped = 0
+    S.macro = emptyMacro()
+    if dispatcher then dispatcher.fault = nil end
+end
+local function startRecord()
+    idleRequired()
+    assert(cashNow() ~= nil and towers(), "Нет Cash/workspace.Towers; войдите в матч")
+    refreshRecordCache()
+    assert(S.spawnRemote and S.upgradeRemote, "Нет SpawnTower/UpgradeTower")
+    if not S.modeRemote then notify("ChangeTowerMode не найден: запись смены цели недоступна") end
+    local ok, err = installHook()
+    assert(ok, err)
+    resetMemory()
+    S.towerSet = snapshotTowers()
+    dispatcher.capture = captureCall
+    S.recording = true
+    notify("Запись подтверждённых действий включена. Отказы сервера в шаги не попадают")
+end
+local function startPlayback()
+    idleRequired()
+    local data = currentMacro()
+    assert(#data.steps > 0, "Макрос пуст")
+    assert(data.gameId == game.GameId and data.placeId == game.PlaceId, "Макрос записан в другом PlaceId/GameId")
+    assert(cashNow() ~= nil and towers(), "Нет Cash/workspace.Towers")
+    S.macro, S.cursor, S.playRefs = data, 1, {}
+    S.playEpoch = S.playEpoch + 1
+    S.playing = true
+    hub.Pump()
+end
+
+local fileOK = type(isfile) == "function" and type(isfolder) == "function"
+    and type(makefolder) == "function" and type(readfile) == "function"
+    and type(writefile) == "function" and type(listfiles) == "function"
+local deleteOK = fileOK and type(delfile) == "function"
+local function ensureFolder(path)
+    local partial = ""
+    for part in path:gmatch("[^/]+") do
+        partial = partial == "" and part or partial .. "/" .. part
+        if not isfolder(partial) then makefolder(partial) end
+    end
+end
+local function macroPath(name)
+    assert(safeName(name), "Имя: латиница, цифры, _ и -, до 64 символов")
+    return ROOT .. "/macros/" .. name .. ".json"
+end
+local macroDropdown
+local function refreshMacros(preferred)
+    if not fileOK then return {} end
+    ensureFolder(ROOT .. "/macros")
+    local names, found = {}, {}
+    for _, path in ipairs(listfiles(ROOT .. "/macros")) do
+        if type(path) == "string" then
+            local basename = path:gsub("\\", "/"):match("([^/]+)$")
+            local name = basename and basename:match("^(.-)%.json$")
+            -- Полный путь из listfiles не используется для чтения/удаления.
+            if safeName(name) and not found[name] and isfile(macroPath(name)) then
+                found[name] = true
+                names[#names + 1] = name
+            end
+        end
+    end
+    table.sort(names)
+    if macroDropdown then
+        local chosen = preferred or macroDropdown.Value
+        macroDropdown:SetValues(names)
+        macroDropdown:SetValue(found[chosen] and chosen or names[1])
+        macroDropdown:Display() -- очищает подпись даже при пустом списке Fluent.
+    end
+    return names
+end
+local function selectedName()
+    local name = macroDropdown and macroDropdown.Value
+    assert(safeName(name), "Выберите сохранённый макрос")
+    return name
+end
+local function saveMacro(name)
+    assert(fileOK, "Файловые функции недоступны")
+    assert(not S.recording, "Сначала Stop Recording")
+    local text = Http:JSONEncode(currentMacro())
+    assert(#text <= LIMIT.Bytes, "Файл слишком большой")
+    ensureFolder(ROOT .. "/macros")
+    local path = macroPath(name)
+    writefile(path, text)
+    assert(isfile(path) and readfile(path) == text, "Не удалось проверить запись файла")
+    refreshMacros(name)
+    notify("Сохранено: " .. path)
+end
+local function loadMacro(name)
+    assert(fileOK, "Файловые функции недоступны")
+    idleRequired()
+    local path = macroPath(name)
+    assert(isfile(path), "Файл не найден: " .. path)
+    local text = readfile(path)
+    assert(#text <= LIMIT.Bytes, "Файл слишком большой")
+    local data = validateMacro(Http:JSONDecode(text))
+    -- Память заменяется только после успешной валидации.
+    resetMemory()
+    S.macro = data
+    options.MacroName:SetValue(name)
+    notify("Загружен " .. name .. "; шагов: " .. #data.steps)
+end
+local function deleteMacro(name)
+    assert(deleteOK, "Удаление недоступно: нет delfile")
+    idleRequired()
+    local path = macroPath(name)
+    assert(isfile(path), "Файл уже отсутствует")
+    local text = readfile(path)
+    assert(#text <= LIMIT.Bytes, "Файл слишком большой для резервной копии")
+    ensureFolder(ROOT .. "/trash")
+    local backup = ROOT .. "/trash/" .. name .. "_" .. Http:GenerateGUID(false) .. ".json"
+    assert(not isfile(backup), "Коллизия имени резервной копии")
+    writefile(backup, text)
+    assert(isfile(backup) and readfile(backup) == text, "Копия не подтверждена; исходный файл не удалён")
+    delfile(path)
+    assert(not isfile(path), "Исполнитель не удалил файл; резервная копия сохранена")
+    refreshMacros()
+    notify("Удалён из списка. Копия: " .. backup .. ". Макрос в памяти не изменён")
+end
+
+local camera = WS.CurrentCamera
+local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+local Window = Fluent:CreateWindow({
+    Title = "Slop Tower Defense", SubTitle = "Money-based Hub V2",
+    TabWidth = 150, Size = UDim2.fromOffset(math.min(650, math.max(340, viewport.X - 20)),
+        math.min(500, math.max(300, viewport.Y - 30))),
+    Acrylic = false, Theme = "Dark", MinimizeKey = Enum.KeyCode.LeftControl,
+})
+local Tabs = {
+    Macro = Window:AddTab({ Title = "Macro Recorder", Icon = "" }),
+    Lobby = Window:AddTab({ Title = "Autoplay & Lobby", Icon = "" }),
+    Main = Window:AddTab({ Title = "Main Game Settings", Icon = "" }),
+    Misc = Window:AddTab({ Title = "Misc", Icon = "" }),
+    Configs = Window:AddTab({ Title = "Configs", Icon = "" }),
+}
+local function action(fn)
+    return function()
+        if not S.alive then return end
+        local ok, err = pcall(fn)
+        if not ok then problem("action", err) end
+    end
+end
+local function button(tab, title, callback, description)
+    return tab:AddButton({ Title = title, Description = description, Callback = action(callback) })
+end
+local function toggle(tab, id, title, description)
+    return tab:AddToggle(id, { Title = title, Description = description, Default = false })
+end
+local function confirm(title, content, callback)
+    Window:Dialog({ Title = title, Content = content, Buttons = {
+        { Title = "Подтвердить", Callback = action(callback) },
+        { Title = "Отмена", Callback = function() end },
+    } })
+end
+local statusParagraph = Tabs.Macro:AddParagraph({ Title = "Состояние", Content = "Ожидание" })
+Tabs.Macro:AddParagraph({ Title = "Запись подтверждённых действий", Content =
+    "Записывается только успех InvokeServer (Spawn/Upgrade — модель, Target — true). Отказы (false) пропускаются. " ..
+    "Cash — баланс при подтверждённой покупке. После Stop дождитесь завершения покупок; Play — только в свежем матче." })
+Tabs.Macro:AddInput("MacroName", { Title = "Имя для сохранения / загрузки вручную", Default = "default", Finished = false })
+Tabs.Macro:AddToggle("WaitCashSync", { Title = "Ждать репликацию Cash после покупки", Default = true,
+    Description = "Для бесплатных действий может потребоваться отключение." })
+button(Tabs.Macro, "Start Recording", function()
+    idleRequired()
+    if #S.entries > 0 or #S.macro.steps > 0 then
+        confirm("Новая запись", "Заменить макрос в памяти? Файл не изменится.", startRecord)
+    else startRecord() end
+end)
+button(Tabs.Macro, "Stop Recording", function()
+    S.recording = false
+    notify("Запись выключена. Подтверждено шагов: " .. #S.entries
+        .. "; отклонено сервером: " .. tostring(S.recordSkipped or 0))
+end)
+button(Tabs.Macro, "Play Macro (из памяти)", startPlayback)
+button(Tabs.Macro, "Stop Macro", function() stopPlayback("Остановлено; отправленные запросы не отзываются") end)
+button(Tabs.Macro, "Clear Macro", function()
+    confirm("Clear Macro", "Очистить память? Файлы останутся.", function()
+        idleRequired()
+        resetMemory()
+        notify("Макрос в памяти очищен")
+    end)
+end)
+button(Tabs.Macro, "Save Macro to File", function()
+    assert(fileOK, "Файловые функции недоступны")
+    local name = opt("MacroName", "default")
+    local path = macroPath(name)
+    if isfile(path) then
+        confirm("Перезапись", "Заменить файл " .. name .. "?", function() saveMacro(name) end)
+    else saveMacro(name) end
+end)
+local function requestLoad(name, play)
+    idleRequired()
+    local function run()
+        loadMacro(name)
+        if play then startPlayback() end
+    end
+    if #S.entries > 0 or #S.macro.steps > 0 then
+        confirm(play and "Загрузить и запустить" or "Загрузить", "Заменить макрос в памяти файлом " .. name .. "?", run)
+    else run() end
+end
+button(Tabs.Macro, "Load Macro from File (по имени)", function() requestLoad(opt("MacroName", "default"), false) end)
+macroDropdown = Tabs.Macro:AddDropdown("SavedMacro", {
+    Title = "Сохранённые макросы", Values = {}, Multi = false, AllowNull = true,
+})
+macroDropdown:OnChanged(function(name)
+    if safeName(name) then options.MacroName:SetValue(name) end
+end)
+button(Tabs.Macro, "Refresh: обновить список", function()
+    local names = refreshMacros()
+    notify(fileOK and ("Файлов: " .. #names) or "Файловые функции недоступны")
+end)
+button(Tabs.Macro, "Загрузить выбранный макрос", function() requestLoad(selectedName(), false) end)
+button(Tabs.Macro, "Запустить выбранный макрос", function() requestLoad(selectedName(), true) end,
+    "Читает выбранный файл заново, затем запускает с первого шага; нужен свежий матч.")
+button(Tabs.Macro, "Удалить выбранный макрос", function()
+    assert(deleteOK, "Удаление недоступно: нет delfile")
+    idleRequired()
+    local name = selectedName()
+    confirm("Удалить макрос", "Удалить " .. name .. " из macros? Копия останется в SlopTowerDefenseHub/trash.",
+        function() deleteMacro(name) end)
+end)
+if fileOK then action(refreshMacros)() end
+
+Tabs.Lobby:AddDropdown("LobbyMode", { Title = "Режим", Values = { "Survival", "Raid" }, Default = "Survival" })
+toggle(Tabs.Lobby, "ManualElevator", "Выбирать лифт вручную", "Иначе режим определяет Elevator1 / Elevator6")
+Tabs.Lobby:AddDropdown("Elevator", { Title = "Лифт вручную", Values = ELEVATORS, Default = "Elevator6" })
+Tabs.Lobby:AddParagraph({ Title = "Маршруты", Content =
+    "Survival: Elevator6 (-11, 61, 100). Raid: Elevator1 (-10, 70.5, 142). Elevator2–5: только Remote." })
+Tabs.Lobby:AddInput("LobbyPlaceId", { Title = "PlaceId лобби", Default = "", Numeric = true, Finished = false })
+button(Tabs.Lobby, "Запомнить текущий PlaceId как лобби", function()
+    options.LobbyPlaceId:SetValue(tostring(game.PlaceId))
+    notify("PlaceId лобби установлен. Сохраните конфиг")
+end, "Нажимайте только в лобби.")
+toggle(Tabs.Lobby, "AutoElevator", "Auto Enter Elevator", "Только в указанном PlaceId; интервал 12 секунд")
+toggle(Tabs.Lobby, "MoveToElevator", "Перемещать персонажа к лифту", "Координаты есть только для Elevator1 / Elevator6")
+toggle(Tabs.Lobby, "AutoReplay", "Auto Replay / EndScreen", "EndDecision(true); уступает приоритет Auto Leave")
+toggle(Tabs.Lobby, "AutoLeave", "Auto Leave to Lobby upon Game End", "ExitGame:FireServer() без аргументов; приоритет над Replay")
+Tabs.Lobby:AddParagraph({ Title = "Конец матча", Content =
+    "Один общий шлюз: Exit либо Replay один раз на показ EndScreen. Переключение опций после отправки не отправляет вторую команду. " ..
+    "Сбой телепортации: повтор автоматом не выполняется; используйте игровой интерфейс." })
+toggle(Tabs.Main, "AutoMap", "Auto Vote Map")
+Tabs.Main:AddDropdown("Map", { Title = "Карта", Values = MAPS, Default = "Area 51" })
+toggle(Tabs.Main, "AutoDifficulty", "Auto Vote Difficulty")
+Tabs.Main:AddDropdown("Difficulty", { Title = "Сложность", Values = { "Normal", "Hard", "Nightmare" }, Default = "Normal" })
+toggle(Tabs.Main, "AutoSpeed", "Auto Game Speed", "Попытки раз в 3 секунды, только если скорость отличается")
+Tabs.Main:AddSlider("Speed", { Title = "Скорость", Default = 1, Min = 1, Max = 5, Rounding = 0 })
+toggle(Tabs.Misc, "AntiMacro", "Anti-Macro: отвечать на Check", "Исходное предположение: Check(key: string). Принятие ответа не подтверждено")
+Tabs.Misc:AddSlider("AntiArg", { Title = "Номер аргумента Check с ключом", Default = 1, Min = 1, Max = 10, Rounding = 0 })
+Tabs.Misc:AddInput("AntiField", { Title = "Путь к ключу внутри таблицы", Default = "", Finished = false })
+toggle(Tabs.Misc, "AntiMulti", "Разрешить несколько аргументов Check", "Только после проверки реальной сигнатуры")
+local antiParagraph = Tabs.Misc:AddParagraph({ Title = "AntiMacro.Check", Content = S.antiStatus })
+toggle(Tabs.Misc, "AntiAFK", "Anti-AFK (VirtualUser)")
+toggle(Tabs.Misc, "AutoWalk", "Auto-walk", "Боковой шаг каждые 2 секунды; при работе лифта приостанавливается")
+local diagnostics = Tabs.Misc:AddParagraph({ Title = "Диагностика", Content = "Ожидание" })
+
+local function worker(name, callback)
+    if S.workers[name] or not S.alive then return end
+    S.workers[name] = true
+    task.spawn(function()
+        local ok, err = pcall(callback)
+        S.workers[name] = nil
+        if not ok and S.alive then problem(name, err) end
+    end)
+end
+local function gameGui()
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    return pg and pg:FindFirstChild("GameGui") or nil
+end
+local function visible(obj)
+    if not obj or not obj:IsA("GuiObject") then return false end
+    local current = obj
+    while current and current ~= LP do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("ScreenGui") and not current.Enabled then return false end
+        current = current.Parent
+    end
+    return obj:IsDescendantOf(LP)
+end
+local gates = {}
+local function guiGate(key, frameName, enabled, selection, eventName, argument)
+    local gui = gameGui()
+    local frame = gui and gui:FindFirstChild(frameName)
+    local gate = gates[key]
+    if not gate or gate.frame ~= frame then
+        if gate and gate.connection then gate.connection:Disconnect() end
+        gate = { frame = frame, sent = nil, lastAttempt = -math.huge }
+        gates[key] = gate
+        if frame and frame:IsA("GuiObject") then
+            gate.connection = frame:GetPropertyChangedSignal("Visible"):Connect(function()
+                if not frame.Visible then gate.sent = nil end
+            end)
+        end
+    end
+    if not enabled or not visible(frame) then gate.sent = nil; return end
+    if gate.sent == selection or os.clock() - gate.lastAttempt < 2 then return end
+    gate.lastAttempt = os.clock()
+    local ok, err = fire("Events", eventName, argument)
+    if ok then gate.sent = selection else problem(key, err) end
+end
+
+-- BEGIN END GATE
+local endGate = { active = false, sent = nil, lastAttempt = -math.huge }
+local function endCycle()
+    local gui = gameGui()
+    local frame = gui and gui:FindFirstChild("EndScreen")
+    if frame ~= endGate.frame then
+        if endGate.connection then endGate.connection:Disconnect() end
+        endGate.frame, endGate.connection = frame, nil
+        if frame and frame:IsA("GuiObject") then
+            endGate.connection = frame:GetPropertyChangedSignal("Visible"):Connect(function()
+                if not frame.Visible then endGate.active = false end
+            end)
+        end
+    end
+    if not visible(frame) then
+        endGate.active, endGate.sent = false, nil
+        return
+    end
+    if not endGate.active then
+        endGate.active, endGate.sent, endGate.lastAttempt = true, nil, -math.huge
+    end
+    if S.playing then stopPlayback("Матч завершён; макрос остановлен") end
+    if S.recording then
+        S.recording = false
+        notify("Матч завершён; запись остановлена")
+    end
+    if endGate.sent then return end
+    local decision = opt("AutoLeave", false) and "Exit"
+        or (opt("AutoNewMap", false) and "New" or (opt("AutoReplay", false) and "Replay" or nil))
+    if not decision or os.clock() - endGate.lastAttempt < 2 then return end
+    endGate.lastAttempt = os.clock()
+    local eventName = decision == "Exit" and "ExitGame" or "EndDecision"
+    local r = remote("Events", eventName, "RemoteEvent")
+    if not r then problem("end", "Нет Events." .. eventName); return end
+    -- Отмечаем попытку ДО отправки. При неопределённом исходе не повторяем.
+    endGate.sent = decision
+    local ok, err
+    if decision == "Exit" then
+        ok, err = pcall(function() r:FireServer() end) -- ноль аргументов, не nil/false/таблица
+    elseif decision == "New" then
+        ok, err = pcall(function() r:FireServer("new") end)
+    else
+        ok, err = pcall(function() r:FireServer(true) end)
+    end
+    if not ok then problem("end", "Команда конца матча не подтверждена: " .. tostring(err)) end
+end
+-- END END GATE
+
+local function extractToken(args, index, field, allowMultiple)
+    if not allowMultiple and args.n ~= 1 then return nil end
+    local value = args[index]
+    if field ~= "" then
+        if not field:match("^[%w_]+[%.%w_]*$") or field:find("..", 1, true) or field:sub(-1) == "." then return nil end
+        for part in field:gmatch("[^.]+") do
+            if type(value) ~= "table" then return nil end
+            value = value[part]
+        end
+    end
+    if type(value) == "string" and #value > 0 then return value end
+    return nil
+end
+local antiConnection, antiRemote
+local lastTokens, tokenQueue = {}, {}
+local function describePayload(args)
+    local parts = {}
+    for i = 1, math.min(args.n, 10) do
+        local value = args[i]
+        local desc = tostring(i) .. ":" .. typeof(value)
+        if type(value) == "table" then
+            local types, count = {}, 0
+            for k, v in pairs(value) do
+                count = count + 1
+                if count > 8 then break end
+                types[#types + 1] = typeof(k) .. "->" .. typeof(v)
+            end
+            table.sort(types)
+            desc = desc .. "{" .. table.concat(types, ",") .. "}"
+        end
+        parts[#parts + 1] = desc
+    end
+    return "Аргументов: " .. args.n .. "; " .. table.concat(parts, "; ")
+end
+local function bindAntiMacro()
+    local events = RS:FindFirstChild("Events")
+    local folder = events and events:FindFirstChild("AntiMacro")
+    local check = folder and folder:FindFirstChild("Check")
+    if check and not check:IsA("RemoteEvent") then check = nil end
+    if check == antiRemote then return end
+    if antiConnection then antiConnection:Disconnect(); antiConnection = nil end
+    antiRemote = check
+    lastTokens, tokenQueue = {}, {}
+    if not check then S.antiStatus = "AntiMacro.Check отсутствует"; return end
+    S.antiStatus = "Check найден; ожидание события"
+    antiConnection = check.OnClientEvent:Connect(function(...)
+        if not S.alive then return end
+        local args = table.pack(...)
+        local ok, err = pcall(function()
+            S.antiStatus = describePayload(args)
+            if not opt("AntiMacro", false) then return end
+            local key = extractToken(args, tonumber(opt("AntiArg", 1)) or 1,
+                opt("AntiField", ""), opt("AntiMulti", false))
+            if not key then problem("anti-shape", "Check: формат ключа не подтверждён; ответ не отправлен"); return end
+            if lastTokens[key] then return end
+            local respond = folder:FindFirstChild("Respond")
+            if not respond or not respond:IsA("RemoteEvent") then problem("anti-remote", "Нет AntiMacro.Respond"); return end
+            respond:FireServer(key)
+            lastTokens[key] = true
+            tokenQueue[#tokenQueue + 1] = key
+            if #tokenQueue > 32 then lastTokens[table.remove(tokenQueue, 1)] = nil end
+            S.antiStatus = S.antiStatus .. " | Ответ отправлен; принятие не подтверждено"
+        end)
+        if not ok then problem("anti", err) end
+    end)
+end
+local function inConfiguredLobby() return tonumber(opt("LobbyPlaceId", "")) == game.PlaceId end
+local function elevatorCycle()
+    if not opt("AutoElevator", false) or S.recording or S.playing then return end
+    if not inConfiguredLobby() then problem("lobby-place", "Укажите PlaceId лобби"); return end
+    if os.clock() - S.lastElevator < 12 then return end
+    S.lastElevator = os.clock()
+    local name = opt("ManualElevator", false) and opt("Elevator", "Elevator6")
+        or (opt("LobbyMode", "Survival") == "Raid" and "Elevator1" or "Elevator6")
+    local enter = remote("Events", "EnterElevator", "RemoteEvent")
+    local start = remote("Events", "StartElevator", "RemoteEvent")
+    if not enter or not start then problem("elevator", "Remotes лифта отсутствуют"); return end
+    local function enabled()
+        return S.alive and opt("AutoElevator", false) and inConfiguredLobby() and not S.recording and not S.playing
+    end
+    worker("elevator", function()
+        if not enabled() then return end
+        if opt("MoveToElevator", false) then
+            local pos = ELEVATOR_POS[name]
+            if not pos then problem("elevator-pos", "Для " .. name .. " координаты неизвестны; только Remote") end
+            local character = LP.Character
+            local hrp = character and character:FindFirstChild("HumanoidRootPart")
+            if pos then
+                assert(hrp, "Нет HumanoidRootPart")
+                hrp.CFrame = CFrame.new(pos)
+                task.wait(0.25)
+            end
+        end
+        if not enabled() then return end
+        enter:FireServer(name)
+        task.wait(0.8)
+        if enabled() then start:FireServer(name) end
+    end)
+end
+local speedAttempt = -math.huge
+local function speedCycle()
+    if not opt("AutoSpeed", false) or S.locks.speed or S.workers.speed then return end
+    local info = WS:FindFirstChild("Info")
+    local value = info and info:FindFirstChild("SpeedGame")
+    local speed = math.clamp(math.floor(tonumber(opt("Speed", 1)) or 1), 1, 5)
+    if not value or not (value:IsA("NumberValue") or value:IsA("IntValue")) then return end
+    if value.Value == speed or os.clock() - speedAttempt < 3 then return end
+    local r = remote("Functions", "ChangeSpeed", "RemoteFunction")
+    if not r then return end
+    speedAttempt = os.clock()
+    worker("speed", function()
+        local result, err = invoke("speed", r, table.pack(speed), function() return opt("AutoSpeed", false) end)
+        if not result and S.alive then problem("speed", err) end
+    end)
+end
+local walkAt, walkSign = -math.huge, 1
+local function walkCycle()
+    if not opt("AutoWalk", false) or S.workers.walk or S.workers.elevator then return end
+    if opt("AutoElevator", false) and inConfiguredLobby() then return end
+    if os.clock() - walkAt < 2 then return end
+    walkAt = os.clock()
+    local character = LP.Character
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hum or not hrp or hum.Health <= 0 or hum.Sit or hum.MoveDirection.Magnitude > 0.05 then return end
+    walkSign = -walkSign
+    local direction = hrp.CFrame.RightVector * walkSign
+    local destination = hrp.Position + Vector3.new(direction.X, 0, direction.Z) * 1.5
+    worker("walk", function()
+        if not S.alive or not opt("AutoWalk", false) then return end
+        S.walkHumanoid = hum
+        hum:MoveTo(destination)
+        task.wait(0.35)
+        if hum.Parent and LP.Character == character then hum:Move(Vector3.zero, false) end
+        S.walkHumanoid = nil
+    end)
+end
+local function releaseVU()
+    if S.vuHeld then
+        S.vuHeld = false
+        pcall(function() VU:Button2Up(Vector2.zero, (WS.CurrentCamera and WS.CurrentCamera.CFrame) or CFrame.new()) end)
+    end
+end
+connect(LP.Idled, function()
+    if not S.alive or not opt("AntiAFK", false) then return end
+    worker("afk", function()
+        if not S.alive or not opt("AntiAFK", false) then return end
+        VU:CaptureController()
+        VU:Button2Down(Vector2.zero, (WS.CurrentCamera and WS.CurrentCamera.CFrame) or CFrame.new())
+        S.vuHeld = true
+        task.wait(0.15)
+        releaseVU()
+    end)
+end)
+function hub.Destroy(reason)
+    if not S.alive then return end
+    S.alive, S.recording, S.playing = false, false, false
+    S.playEpoch, S.recordEpoch = S.playEpoch + 1, S.recordEpoch + 1
+    if dispatcher and dispatcher.capture == captureCall then dispatcher.capture = nil end
+    for _, c in ipairs(S.connections) do pcall(c.Disconnect, c) end
+    for _, gate in pairs(gates) do if gate.connection then gate.connection:Disconnect() end end
+    if endGate.connection then endGate.connection:Disconnect() end
+    if S.cashConnection then S.cashConnection:Disconnect() end
+    if S.towerAdded then S.towerAdded:Disconnect() end
+    if S.towerRemoved then S.towerRemoved:Disconnect() end
+    if antiConnection then antiConnection:Disconnect() end
+    if S.walkHumanoid and S.walkHumanoid.Parent then pcall(S.walkHumanoid.Move, S.walkHumanoid, Vector3.zero, false) end
+    releaseVU()
+    if S.mobileGui then S.mobileGui:Destroy() end
+    table.clear(S.rawQueue)
+    S.pending, S.queueHead, S.queueTail, S.drainScheduled = 0, 1, 0, false
+    table.clear(lastTokens)
+    table.clear(tokenQueue)
+    if not Fluent.Unloaded then pcall(function() Fluent:Destroy() end) end
+    -- Tombstone остаётся в G: незавершённые собственные InvokeServer удерживают locks.
+end
+button(Tabs.Misc, "Unload Hub", function() hub.Destroy("Выгрузка") end)
+local okMobile, mobileError = pcall(function()
+    local pg = LP:FindFirstChildOfClass("PlayerGui") or LP:WaitForChild("PlayerGui", 5)
+    assert(pg, "Нет PlayerGui")
+    local screen = Instance.new("ScreenGui")
+    S.mobileGui = screen
+    screen.Name, screen.ResetOnSpawn, screen.DisplayOrder = "STDHubToggle", false, 10000
+    screen.Parent = pg
+    local b = Instance.new("TextButton")
+    b.Size, b.Position = UDim2.fromOffset(76, 34), UDim2.new(1, -86, 0, 8)
+    b.Text, b.TextSize = "Slop Hub", 13
+    b.BackgroundColor3, b.TextColor3 = Color3.fromRGB(35, 35, 40), Color3.new(1, 1, 1)
+    b.Parent = screen
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius, corner.Parent = UDim.new(0, 8), b
+    connect(b.Activated, action(function() Window:Minimize() end))
+end)
+if not okMobile then problem("mobile", mobileError) end
+local SaveManager, InterfaceManager
+local managersReady = false
+if fileOK then
+    local ok, err = pcall(function()
+        ensureFolder(ROOT .. "/macros")
+        SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
+        InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
+        SaveManager:SetLibrary(Fluent)
+        InterfaceManager:SetLibrary(Fluent)
+        SaveManager:IgnoreThemeSettings()
+        SaveManager:SetIgnoreIndexes({ "SavedMacro" }) -- список файлов не является настройкой конфига.
+        InterfaceManager:SetFolder(ROOT)
+        SaveManager:SetFolder(ROOT .. "/configs")
+        local originalSave, originalLoad = SaveManager.Save, SaveManager.Load
+        function SaveManager:Save(name)
+            if not safeName(name) then return false, "Имя: латиница, цифры, _ или -" end
+            local good, result, message = pcall(originalSave, self, name)
+            if not good then return false, tostring(result) end
+            return result, message
+        end
+        function SaveManager:Load(name)
+            if not safeName(name) then return false, "Недопустимое имя конфига" end
+            local good, result, message = pcall(originalLoad, self, name)
+            if not good then return false, tostring(result) end
+            return result, message
+        end
+        InterfaceManager:BuildInterfaceSection(Tabs.Configs)
+        SaveManager:BuildConfigSection(Tabs.Configs)
+        managersReady = true
+    end)
+    if not ok then problem("configs", "Конфиги недоступны: " .. tostring(err)) end
+else
+    Tabs.Configs:AddParagraph({ Title = "Нет файловых функций", Content =
+        "Нужны readfile/writefile/isfile/isfolder/makefolder/listfiles. Для удаления дополнительно delfile." })
+end
+Tabs.Configs:AddParagraph({ Title = "Автозагрузка", Content =
+    "Create config -> выбрать -> Set as autoload. Макросы хранятся отдельно. Запись и Play автоматически не запускаются. " ..
+    "При включённых обоих режимах завершения выбирается Auto Leave. После смены Place перезапустите скрипт." })
+-- ЗАМЕНА исходного блока do с persistentKey = "__STD_AUTOMACRO_ROUND_V1".
+-- Конец заменяемого участка: end перед комментарием -- КОНЕЦ ВСТАВКИ.
+-- Вставить ВМЕСТО этого участка, НЕ запускать отдельным файлом в Delta.
+-- Остальной хаб, включая Window:SelectTab(1), autoload и return hub, оставить.
+-- Требуется свежий вход на сервер. Roblox/Delta здесь не тестировались.
+-- cash в старом макросе = баланс записи, НЕ цена. requiredCash = ручной порог.
+-- Хук записи не изменяется. Автоповторов покупок после ошибки нет.
+do
+    local A = {
+        alive = true, ready = false, loading = false, configFailed = false,
+        launching = false, syncing = false, evaluating = false,
+        waveObject = nil, waveConnection = nil, status = "Инициализация",
+        runEpoch = nil, phase = "Ожидание", reason = "", log = {},
+        startedAt = nil, startWave = nil, firstSentAt = nil, firstSentWave = nil,
+        lastConfirmedAt = nil, runThreshold = nil, lastDetail = nil,
+    }
+    local persistentKey = "__STD_AUTOMACRO_ROUND_V2"
+    local gate = G[persistentKey]
+    if type(gate) ~= "table" or gate.placeId ~= game.PlaceId
+        or gate.gameId ~= game.GameId or gate.jobId ~= game.JobId then
+        gate = {
+            placeId = game.PlaceId, gameId = game.GameId, jobId = game.JobId,
+            lastWave = nil, zeroSeen = false, endSeen = false,
+            consumed = false, round = 1, reason = nil,
+        }
+        G[persistentKey] = gate
+    end
+
+    -- BEGIN PURE HELPERS
+    local function observedToken(args)
+        if args.n ~= 4 or type(args[1]) ~= "string" or #args[1] == 0 then return nil end
+        if not finite(args[2]) or not finite(args[3]) or not finite(args[4]) then return nil end
+        return args[1]
+    end
+    local function stepThreshold(step)
+        local explicit = step.requiredCash
+        if explicit ~= nil then
+            assert(finite(explicit) and explicit >= 0, "Неверный requiredCash")
+            return explicit, "ручной порог/цена"
+        end
+        assert(finite(step.cash) and step.cash >= 0, "Неверный cash")
+        return step.cash, "баланс при записи, НЕ цена"
+    end
+    local function observeRound(g, wave, ended, lobby)
+        if lobby then
+            g.zeroSeen, g.lastWave = true, nil
+            return false
+        end
+        if ended then
+            g.endSeen = true
+            if finite(wave) and wave % 1 == 0 then
+                if wave <= 0 or (wave == 1 and finite(g.lastWave) and g.lastWave > 1) then
+                    g.zeroSeen = true
+                end
+                g.lastWave = wave
+            end
+            return false
+        end
+        if not finite(wave) or wave % 1 ~= 0 then return false end
+        if wave <= 0 then
+            g.zeroSeen, g.lastWave = true, wave
+            return false
+        end
+        if wave == 1 then
+            local fresh = g.zeroSeen or (finite(g.lastWave) and g.lastWave > 1)
+            if fresh then
+                g.round = g.round + 1
+                g.consumed, g.reason, g.endSeen = false, nil, false
+            end
+            g.zeroSeen, g.lastWave = false, wave
+            return not g.endSeen and not g.consumed
+        end
+        g.zeroSeen, g.lastWave = false, wave
+        return false
+    end
+    local function delayRemaining(lastConfirmedAt, delay, now)
+        if not lastConfirmedAt then return 0 end
+        return math.max(0, lastConfirmedAt + delay - now)
+    end
+    -- END PURE HELPERS
+
+    local baseValidate = validateMacro
+    validateMacro = function(data)
+        local result = baseValidate(data)
+        for _, step in ipairs(result.steps) do stepThreshold(step) end
+        return result
+    end
+    local function readWave()
+        local info = WS:FindFirstChild("Info")
+        local obj = info and info:FindFirstChild("Wave")
+        if obj and not (obj:IsA("IntValue") or obj:IsA("NumberValue")) then obj = nil end
+        return obj, obj and obj.Value or nil
+    end
+    local function endVisible()
+        local gui = gameGui()
+        return visible(gui and gui:FindFirstChild("EndScreen"))
+    end
+    local function trace(event, detail)
+        local _, wave = readWave()
+        local balance = S.cash and S.cash.Value
+        local line = string.format("t=%.3f wave=%s cash=%s step=%s %s %s",
+            os.clock(), tostring(wave), tostring(balance), tostring(S.cursor),
+            event, detail or "")
+        if #A.log >= 300 then table.remove(A.log, 1) end
+        A.log[#A.log + 1] = line
+        print("[STD Playback] " .. line)
+    end
+    local function phase(name, detail)
+        detail = detail or ""
+        if A.phase ~= name or A.reason ~= detail then
+            A.phase, A.reason = name, detail
+            trace(name, detail)
+        end
+    end
+
+-- ЗАМЕНА внутри do-блока __STD_AUTOMACRO_ROUND_V2:
+-- от комментария «Исправление формы Check...» до конца AddParagraph «Исправленный AntiMacro».
+-- Если уже вставлен черновик (3), заменить весь его do...end этим блоком.
+-- Следующий Tabs.Macro:AddSlider("StepDelay", ...) оставить.
+-- НЕ самостоятельный скрипт. Нужны локальные переменные присланного хаба.
+-- Проверено локальными тестами с заглушками, НЕ в Roblox/Delta.
+-- Включить AntiMacro ДО следующего Check. Уже открытое окно подтвердить вручную.
+do
+    local B = { serial = 0, bound = nil, playerGui = nil,
+        excluded = setmetatable({}, { __mode = "k" }) }
+    local function excludeExisting(pg)
+        if not pg then return end
+        for _, gui in ipairs(pg:GetChildren()) do
+            if gui.Name == "AntiMacroCheck" and gui:IsA("ScreenGui") then
+                B.excluded[gui] = true
+            end
+        end
+    end
+    local function candidate(pg, x, y)
+        if not pg then return nil end
+        local found
+        for _, gui in ipairs(pg:GetChildren()) do
+            if gui.Name == "AntiMacroCheck" and gui:IsA("ScreenGui")
+                and gui.Enabled and not B.excluded[gui] then
+                local frame = gui:FindFirstChild("Frame")
+                local btn = frame and frame:FindFirstChild("TextButton")
+                if frame and frame:IsA("Frame") and frame.Visible and btn
+                    and btn:IsA("TextButton") and btn.Visible and btn.Text == "I'm here" then
+                    local p = btn.Position
+                    -- x/y приходят вместе с ключом; ключ в GUI не хранится.
+                    -- Это дополнительная клиентская корреляция, НЕ серверное подтверждение.
+                    if math.abs(p.X.Scale - x) <= 0.000001 and math.abs(p.Y.Scale - y) <= 0.000001
+                        and p.X.Offset == 0 and p.Y.Offset == 0 then
+                        if found then return nil end -- неоднозначность: ничего не отправляем/не удаляем
+                        found = gui
+                    end
+                end
+            end
+        end
+        return found
+    end
+    bindAntiMacro = function()
+        local events = RS:FindFirstChild("Events")
+        local folder = events and events:FindFirstChild("AntiMacro")
+        local check = folder and folder:FindFirstChild("Check")
+        if check and not check:IsA("RemoteEvent") then check = nil end
+        local pg = LP:FindFirstChildOfClass("PlayerGui")
+        if B.bound == check and B.playerGui == pg then return end
+        B.serial = B.serial + 1
+        B.bound, B.playerGui = check, pg
+        B.excluded = setmetatable({}, { __mode = "k" })
+        excludeExisting(pg)
+        if antiConnection then antiConnection:Disconnect(); antiConnection = nil end
+        antiRemote = check
+        lastTokens, tokenQueue = {}, {}
+        if not check then S.antiStatus = "AntiMacro.Check отсутствует"; return end
+        S.antiStatus = "Ожидание нового Check(key, x, y, seconds)"
+        antiConnection = check.OnClientEvent:Connect(function(...)
+            if not S.alive or not A.alive then return end
+            B.serial = B.serial + 1 -- новый Check отменяет ожидание предыдущего
+            local serial, args, receivedAt = B.serial, table.pack(...), os.clock()
+            local key, seconds = args[1], tonumber(args[4])
+            local shapeOK = args.n == 4 and type(key) == "string" and #key > 0 and #key <= 512
+                and finite(args[2]) and finite(args[3]) and finite(seconds) and seconds > 0
+            -- Режим фиксируется при получении: включение после Check не отвечает задним числом.
+            local enabled = opt("AntiMacro", false) and LP:GetAttribute("NoAntiMacro") ~= true
+            task.defer(function()
+                local function current()
+                    return S.alive and A.alive and B.serial == serial and B.bound == check
+                        and B.playerGui == pg and pg and pg.Parent == LP
+                        and check.Parent == folder and folder.Parent == events
+                        and RS:FindFirstChild("Events") == events
+                end
+                if not current() then return end
+                if not shapeOK or not enabled or lastTokens[key] then
+                    -- Включая окна, созданные пока автоответ был выключен.
+                    excludeExisting(pg)
+                    S.antiStatus = not shapeOK and "Неизвестная/просроченная форма Check; ответ не отправлен"
+                        or (not enabled and "Автоответ выключен либо NoAntiMacro=true; подтвердите вручную"
+                        or "Ключ уже обработан; повторного Respond нет")
+                    return
+                end
+                local expiresAt = receivedAt + seconds
+                local function valid()
+                    return current() and opt("AntiMacro", false)
+                        and LP:GetAttribute("NoAntiMacro") ~= true and os.clock() < expiresAt
+                end
+                local ok = pcall(function()
+                    -- Не предполагаем, что одного defer всегда достаточно для создания GUI.
+                    -- Перед отправкой нужен соответствующий новый GUI; старые окна не трогаем.
+                    local deadline = math.min(expiresAt, receivedAt + 2)
+                    repeat
+                        if not valid() then return end
+                        local gui = candidate(pg, args[2], args[3])
+                        if gui then
+                            local respond = folder:FindFirstChild("Respond")
+                            if not respond or not respond:IsA("RemoteEvent") then
+                                S.antiStatus = "Нет AntiMacro.Respond; ответ не отправлен"
+                                return
+                            end
+                            -- До отправки фиксируем попытку. Никаких повторов после исключения.
+                            lastTokens[key] = true
+                            tokenQueue[#tokenQueue + 1] = key
+                            if #tokenQueue > 32 then lastTokens[table.remove(tokenQueue, 1)] = nil end
+                            B.excluded[gui] = true
+                            respond:FireServer(key) -- только первый аргумент текущего Check
+                            -- Как штатная кнопка: локальное закрытие после отправки, без yield.
+                            if valid() and gui.Parent == pg then gui:Destroy() end
+                            if current() then
+                                S.antiStatus = "Respond отправлен; локальное закрытие выполнено при актуальном GUI; серверный ACK отсутствует"
+                            end
+                            return
+                        end
+                        task.wait()
+                    until os.clock() >= deadline
+                    if current() then
+                        S.antiStatus = "Новое однозначное окно не найдено вовремя; Respond не отправлен, подтвердите вручную"
+                    end
+                end)
+                if not ok and current() then
+                    -- Текст исключения может содержать ключ: его намеренно не выводим.
+                    S.antiStatus = "Ошибка Respond/GUI; автоматического повтора нет, проверьте окно вручную"
+                    problem("anti-source-fix", S.antiStatus)
+                end
+                if current() then excludeExisting(pg) end
+            end)
+        end)
+    end
+    Tabs.Misc:AddParagraph({ Title = "AntiMacro по исходнику AntiMacroClient", Content =
+        "Check(key, x, y, seconds): новый GUI сверяется по координатам кнопки, Respond получает только key. " ..
+        "После отправки закрывается только соответствующее окно. Закрытие НЕ доказывает принятие сервером. " ..
+        "Включайте Anti-Macro до нового Check; старое окно подтвердите вручную. " ..
+        "AntiArg/AntiField/AntiMulti не используются. RoundStart/Functions.AntiMacro не вызываются; NoAntiMacro не меняется." })
+end
+
+
+   -- Slop TD: замена участка внутри do-блока __STD_AUTOMACRO_ROUND_V2.
+-- НЕ отдельный скрипт для Delta. Использует локальные переменные вашего хаба.
+-- ЗАМЕНИТЬ начиная с Tabs.Macro:AddSlider("StepDelay", ...)
+-- и ДО строки local autoParagraph = Tabs.Macro:AddParagraph(...), НЕ включая её.
+-- Весь AntiMacro-блок выше и весь автомакрос/Webhooks ниже оставить.
+-- Хук и очередь записи не меняются. Старый cash сохраняется как история,
+-- но cash/requiredCash НЕ определяют порог воспроизведения.
+-- Известные пути цен и LVL взяты из вашего сообщения, не с сервера игры.
+-- Runtime Roblox/Delta здесь не проверен.
+
+-- Эти два ID нужны оставшемуся ниже синхронному SaveManager:Load.
+-- Старый конфиг может установить StepDelay=0.25: плеер его НЕ читает.
+Tabs.Macro:AddSlider("StepDelay", { Title = "Legacy StepDelay — не используется", Default = 0,
+    Min = 0, Max = 2, Rounding = 2,
+    Description = "Совместимость старых конфигов. Задержки между успешными шагами нет." })
+Tabs.Macro:AddSlider("CashSyncTimeout", { Title = "Таймаут репликации Cash, секунд", Default = 2,
+    Min = 0.25, Max = 8, Rounding = 2,
+    Description = "При WaitCashSync. Купленное действие не повторяется при задержке Cash." })
+Tabs.Macro:AddSlider("MoneyAttempts", { Title = "Максимум отправок шага", Default = 5,
+    Min = 1, Max = 20, Rounding = 0,
+    Description = "Включая первую отправку. Повторы только после явного false без подтверждения покупки." })
+Tabs.Macro:AddSlider("MoneyRetryDelay", { Title = "Пауза после false, секунд", Default = 0.5,
+    Min = 0.1, Max = 3, Rounding = 2,
+    Description = "Не задерживает первый запрос и успешные шаги; даёт время репликации перед повтором." })
+local playbackParagraph = Tabs.Macro:AddParagraph({ Title = "Причина ожидания / живая цена", Content = "Ожидание" })
+button(Tabs.Macro, "Сохранить журнал воспроизведения", function()
+    assert(fileOK, "Недоступны файловые функции")
+    ensureFolder(ROOT)
+    local path = ROOT .. "/STD_Playback_diagnostic.txt"
+    local text = table.concat(A.log, "\n")
+    writefile(path, text)
+    assert(isfile(path) and readfile(path) == text, "Не подтверждена запись журнала")
+    notify("Журнал: " .. path)
+end)
+Tabs.Macro:AddParagraph({ Title = "Money: текущая цена, не записанный баланс", Content =
+    "Spawn: ReplicatedStorage.Towers[имя из SpawnTower].Config.Price. " ..
+    "Upgrade: атрибут NextUpgradePrice текущей поставленной башни. " ..
+    "cash и requiredCash старого файла игнорируются как пороги. Волна и время записи не используются. " ..
+    "После пропуска башни её дальнейшие Upgrade пропускаются; независимые башни продолжаются." })
+Tabs.Macro:AddParagraph({ Title = "Границы повторов", Content =
+    "После false сначала проверяется, не появилась ли башня / не вырос ли Config.LVL. " ..
+    "При исчерпании попыток — SKIP. Ошибка InvokeServer, зависший запрос или неизвестный " ..
+    "результат без подтверждения — остановка, а не слепой повтор: возможна двойная покупка." })
+
+-- Изолируем дополнительные locals: не увеличиваем их число в основном scope хаба.
+do
+    local INVOKE_TIMEOUT, CONFIRM_TIMEOUT, TOLERANCE = 12, 8, 0.8
+    local function setting(id, fallback, low, high, integral)
+        local value = tonumber(opt(id, fallback))
+        if not finite(value) then value = fallback end
+        value = math.clamp(value, low, high)
+        return integral and math.floor(value) or value
+    end
+    local function numberValue(parent, name)
+        local value = parent and parent:FindFirstChild(name)
+        if value and (value:IsA("NumberValue") or value:IsA("IntValue"))
+            and finite(value.Value) and value.Value >= 0 then
+            return value.Value
+        end
+        return nil
+    end
+    local function level(model)
+        local value = numberValue(model and model:FindFirstChild("Config"), "LVL")
+        if value ~= nil and value % 1 == 0 then return value end
+        return nil
+    end
+    local function livePrice(step)
+        -- Смена цели бесплатна: порог 0, ожидание Cash и CashSync не требуются.
+        if step.kind == "Target" then return 0, "смена цели бесплатна" end
+        if step.kind == "Spawn" then
+            local name = decode(step.args[1])
+            if type(name) ~= "string" then return nil, "Неверное имя Spawn" end
+            local catalog = RS:FindFirstChild("Towers")
+            local template = catalog and catalog:FindFirstChild(name)
+            local price = numberValue(template and template:FindFirstChild("Config"), "Price")
+            if price == nil then return nil, "Нет Config.Price шаблона " .. name end
+            return price, "Config.Price: " .. name
+        end
+        local ref = S.playRefs[step.id]
+        local model = ref and ref.model
+        if not model or model.Parent ~= towers() then return nil, "Нет поставленной башни " .. step.id end
+        local price = model:GetAttribute("NextUpgradePrice")
+        if not finite(price) or price < 0 then return nil, "Нет корректного NextUpgradePrice: " .. step.id end
+        return price, "NextUpgradePrice: " .. step.id
+    end
+
+    -- Проверка файла не должна требовать уже поставленных башен / их живых цен.
+    -- baseValidate — исходная проверка STD-MONEY, объявлена выше в вашем do-блоке.
+    validateMacro = function(data)
+        local result = baseValidate(data)
+        for _, step in ipairs(result.steps) do
+            if step.requiredCash ~= nil then
+                assert(finite(step.requiredCash) and step.requiredCash >= 0, "Неверный legacy requiredCash")
+            end
+        end
+        return result
+    end
+    -- Этот helper используется также существующей диагностикой ниже.
+    -- math.huge — ТОЛЬКО отображаемый маркер отсутствующей цены, не отправляемый порог.
+    stepThreshold = function(step)
+        local price, source = livePrice(step)
+        return price ~= nil and price or math.huge, source
+    end
+    A.blocked, A.skipped, A.completed = {}, 0, 0
+
+    -- Режим цели башни без исключений наружу; nil при отсутствии пути.
+    local function targetMode(model)
+        local ok, value = pcall(function()
+            local config = model and model:FindFirstChild("Config")
+            local obj = config and config:FindFirstChild("TargetMode")
+            if obj and obj:IsA("StringValue") then return obj.Value end
+            return nil
+        end)
+        return ok and value or nil
+    end
+    local function near(model, cf)
+        local p = pivot(model)
+        return p and (p.Position - cf.Position).Magnitude <= TOLERANCE
+    end
+    local function sameSpawn(model, name)
+        return model.Name == name or model:GetAttribute("ID") == name
+    end
+    local function sameUpgrade(model, ctx)
+        local id = model:GetAttribute("ID")
+        return model.Name == ctx.step.name or model.Name == ctx.oldName
+            or (ctx.oldID ~= nil and id == ctx.oldID)
+    end
+    local function observed(ctx)
+        local folder = towers()
+        if not folder or folder ~= ctx.folder then return nil, "Сменился workspace.Towers" end
+        local found
+        -- Только создание подходящей модели либо рост LVL, а не любой fingerprint.
+        for _, model in ipairs(folder:GetChildren()) do
+            if model:IsA("Model") and near(model, ctx.cf) then
+                local matches
+                if ctx.step.kind == "Spawn" then
+                    matches = not ctx.before[model] and sameSpawn(model, ctx.name)
+                elseif ctx.step.kind == "Upgrade" then
+                    local n = level(model)
+                    matches = n ~= nil and n > ctx.oldLevel
+                        and ((model == ctx.target) or (not ctx.before[model] and sameUpgrade(model, ctx)))
+                else
+                    -- Target: только та же башня с изменившимся TargetMode.
+                    local cur = targetMode(model)
+                    matches = (model == ctx.target) and cur ~= nil and ctx.oldMode ~= nil and cur ~= ctx.oldMode
+                end
+                if matches then
+                    if found then return nil, "Неоднозначное подтверждение: несколько башен" end
+                    found = model
+                end
+            end
+        end
+        return found
+    end
+    local function observeFor(ctx, seconds, valid)
+        local deadline = os.clock() + seconds
+        repeat
+            if not valid() then return nil, "Остановлено" end
+            local model, err = observed(ctx)
+            if model or err then return model, err end
+            if os.clock() >= deadline then return nil end
+            task.wait()
+        until false
+    end
+    local function bindResult(ctx, model)
+        S.playRefs[ctx.step.id] = { model = model, cf = pivot(model) or ctx.cf }
+    end
+    local function prepare(step)
+        local remoteName = step.kind == "Spawn" and "SpawnTower"
+            or (step.kind == "Target" and "ChangeTowerMode" or "UpgradeTower")
+        local r = remote("Functions", remoteName, "RemoteFunction")
+        if not r then return nil, "RemoteFunction отсутствует" end
+        local folder = towers()
+        if not folder then return nil, "Нет workspace.Towers" end
+        local ctx = { step = step, remote = r, folder = folder, before = snapshotTowers(), sends = 0 }
+        if step.kind == "Spawn" then
+            ctx.args = decodeArgs(step.args)
+            ctx.name, ctx.cf = ctx.args[1], ctx.args[2]
+        elseif step.kind == "Target" then
+            local ref = S.playRefs[step.id]
+            local target = ref and ref.model
+            if not target or target.Parent ~= folder then return nil, "Потеряна башня " .. step.id end
+            ctx.target, ctx.cf = target, pivot(target)
+            if not ctx.cf then return nil, "Нет позиции башни: " .. step.id end
+            ctx.oldMode = targetMode(target)
+            if ctx.oldMode == nil then return nil, "Нет Config.TargetMode: " .. step.id end
+            ctx.args = table.pack(target)
+        else
+            local ref = S.playRefs[step.id]
+            local target = ref and ref.model
+            if not target or target.Parent ~= folder then return nil, "Потеряна башня " .. step.id end
+            ctx.target, ctx.cf, ctx.oldLevel = target, pivot(target), level(target)
+            if not ctx.cf or ctx.oldLevel == nil then return nil, "Нет позиции или Config.LVL: " .. step.id end
+            ctx.oldName, ctx.oldID = target.Name, target:GetAttribute("ID")
+            ctx.args = table.pack(target, step.name)
+        end
+        return ctx
+    end
+
+    -- Не переопределяем общий invoke(): speed и остальные модули остаются прежними.
+    -- Ticket сохраняет различие между false и неизвестным сетевым исходом.
+    local function sendOnce(ctx, valid)
+        if S.locks.tower then return "unknown", "Предыдущий tower-запрос ещё выполняется" end
+        if not valid() then return "cancel", "Остановлено" end
+        -- Снимок непосредственно перед ПЕРВОЙ отправкой, а не до ожидания денег.
+        if ctx.sends == 0 then ctx.before = snapshotTowers() end
+        local ticket = { done = false }
+        S.locks.tower = ticket
+        ctx.sends = ctx.sends + 1
+        ctx.money, ctx.revision = cashNow(), S.cashVersion
+        ctx.cashObject = S.cash
+        task.spawn(function()
+            local thread = coroutine.running()
+            internal[thread] = true
+            ticket.result = table.pack(pcall(function()
+                -- Все аргументы, включая nil, передаются без изменения сигнатуры.
+                return ctx.remote:InvokeServer(table.unpack(ctx.args, 1, ctx.args.n))
+            end))
+            internal[thread] = nil
+            ticket.done = true
+            if S.locks.tower == ticket then S.locks.tower = nil end
+        end)
+        local done, err = waitUntil(function() return ticket.done end, INVOKE_TIMEOUT, valid)
+        if not done then
+            return valid() and "unknown" or "cancel", tostring(err) .. "; запрос не отозван"
+        end
+        if not ticket.result[1] then return "unknown", "Исключение InvokeServer; исход неизвестен" end
+        if ticket.result[2] == false then return "rejected", "Сервер вернул false" end
+        return "returned"
+    end
+    local function finishPurchase(ctx, model, valid)
+        bindResult(ctx, model)
+        cashNow()
+        if S.cash ~= ctx.cashObject then return "unknown", "Во время покупки заменён объект Cash" end
+        if opt("WaitCashSync", true) and ctx.price > 0
+            and S.cash == ctx.cashObject and S.cashVersion == ctx.revision then
+            phase("CASH_SYNC", "покупка подтверждена; ждём репликацию Cash, без повтора")
+            local synced, err = waitUntil(function()
+                cashNow()
+                return S.cash == ctx.cashObject and S.cashVersion ~= ctx.revision
+            end, setting("CashSyncTimeout", 2, 0.25, 8), valid)
+            if not synced then
+                return valid() and "unknown" or "cancel", "Покупка выполнена, Cash не синхронизирован: " .. tostring(err)
+            end
+        end
+        trace("STEP_DONE", ctx.step.kind .. " " .. ctx.step.id .. "; отправок=" .. ctx.sends)
+        return "done"
+    end
+
+    -- Контракт: done / skip / unknown / cancel. Повторы здесь, НЕ в hook.
+    playStep = function(step, valid)
+        if A.blocked[step.id] then return "skip", "Зависимость пропущена: " .. A.blocked[step.id] end
+        local maximum = setting("MoneyAttempts", 5, 1, 20, true)
+        local retryDelay = setting("MoneyRetryDelay", 0.5, 0.1, 3)
+        local ctx, reason, missing = nil, nil, 0
+        while valid() do
+            if not ctx then ctx, reason = prepare(step) end
+            if ctx then
+                -- На границе повтора вновь проверяем поздно пришедшую репликацию.
+                if ctx.sends > 0 then
+                    local model, err = observed(ctx)
+                    if err then return "unknown", err end
+                    if model then return finishPurchase(ctx, model, valid) end
+                end
+                local price, source = livePrice(step)
+                if price ~= nil then
+                    missing = 0
+                    A.runThreshold = price
+                    if ctx.folder ~= towers() then return "unknown", "Сменился workspace.Towers" end
+                    if step.kind == "Upgrade" and (ctx.target.Parent ~= ctx.folder or level(ctx.target) ~= ctx.oldLevel) then
+                        return ctx.sends > 0 and "unknown" or "skip", "Башня/уровень изменились вне текущего шага"
+                    end
+                    if step.kind == "Target" and ctx.target.Parent ~= ctx.folder then
+                        return ctx.sends > 0 and "unknown" or "skip", "Башня изменилась вне текущего шага"
+                    end
+                    local money = cashNow()
+                    if not finite(money) or money < price then
+                        phase("WAIT_CASH", "нужно " .. price .. " (" .. source .. ")")
+                        task.wait() -- не Wave, не записанный timestamp и не StepDelay
+                    else
+                        if not valid() then return "cancel", "Остановлено" end
+                        ctx.price = price
+                        if not A.firstSentAt then
+                            A.firstSentAt = os.clock()
+                            local _, wave = readWave()
+                            A.firstSentWave = wave -- диагностика, НЕ условие отправки
+                            trace("FIRST_SEND", "цена=" .. price .. "; после старта " ..
+                                string.format("%.3f", A.firstSentAt - A.startedAt) .. " с")
+                        end
+                        phase("INVOKE", step.kind .. " " .. step.id .. "; " .. (ctx.sends + 1) .. "/" .. maximum)
+                        local outcome, detail = sendOnce(ctx, valid)
+                        if outcome == "unknown" or outcome == "cancel" then return outcome, detail end
+                        phase(outcome == "rejected" and "RETRY_CHECK" or "CONFIRM", "ожидание модели / роста Config.LVL")
+                        local model, err = observeFor(ctx,
+                            outcome == "rejected" and retryDelay or CONFIRM_TIMEOUT, valid)
+                        if not valid() then return "cancel", "Остановлено" end
+                        if err then return "unknown", err end
+                        if model then return finishPurchase(ctx, model, valid) end
+                        if outcome ~= "rejected" then
+                            return "unknown", "Ответ получен, но создание/рост LVL не подтверждены; повтор опасен"
+                        end
+                        trace("REJECTED", step.kind .. " " .. step.id .. "; " .. ctx.sends .. "/" .. maximum)
+                        if ctx.sends >= maximum then return "skip", "Лимит явных false: " .. maximum end
+                        -- Следующий цикл заново читает ЦЕНУ и Cash; отсутствие денег не тратит попытку.
+                    end
+                else
+                    reason = source
+                    missing = missing + 1
+                    if missing >= maximum then return "skip", "Данные цены недоступны: " .. tostring(reason) end
+                    phase("WAIT_DATA", tostring(reason) .. "; проверка " .. missing .. "/" .. maximum)
+                    task.wait(retryDelay)
+                end
+            else
+                missing = missing + 1
+                if missing >= maximum then return "skip", "Данные шага недоступны: " .. tostring(reason) end
+                phase("WAIT_DATA", tostring(reason) .. "; проверка " .. missing .. "/" .. maximum)
+                task.wait(retryDelay)
+            end
+        end
+        return "cancel", "Остановлено"
+    end
+
+    hub.Pump = function()
+        if not S.alive or not A.alive or not S.playing or S.pumping then return end
+        S.pumping = true
+        local epoch = S.playEpoch
+        local function valid() return S.alive and A.alive and S.playing and S.playEpoch == epoch end
+        if A.runEpoch ~= epoch then
+            A.runEpoch = epoch
+            A.startedAt, A.firstSentAt, A.firstSentWave = os.clock(), nil, nil
+            A.lastConfirmedAt, A.runThreshold = nil, nil
+            A.blocked, A.skipped, A.completed = {}, 0, 0
+            local _, wave = readWave()
+            A.startWave = wave
+            observeRound(gate, wave, endVisible(), inConfiguredLobby())
+            gate.consumed = true
+            gate.reason = A.launching and "Автозапуск выполнен" or "Ручное воспроизведение уже запускалось"
+            trace("PLAY_START", A.launching and "auto; live money" or "manual; live money")
+        end
+        task.spawn(function()
+            local ok, err = pcall(function()
+                while valid() do
+                    if endVisible() then stopPlayback("Матч завершён"); return end
+                    local step = S.macro.steps[S.cursor]
+                    if not step then
+                        local summary = "Подтверждено: " .. A.completed .. "; пропущено: " .. A.skipped
+                        phase("DONE", summary)
+                        stopPlayback("Макрос завершён. " .. summary)
+                        return
+                    end
+                    local outcome, detail = playStep(step, valid)
+                    if not valid() then return end
+                    if outcome == "done" then
+                        A.completed = A.completed + 1
+                        A.lastConfirmedAt = os.clock() -- только диагностика, задержка от него НЕ считается
+                        S.cursor = S.cursor + 1
+                    elseif outcome == "skip" then
+                        A.skipped = A.skipped + 1
+                        A.blocked[step.id] = A.blocked[step.id] or ("шаг " .. S.cursor .. ": " .. tostring(detail))
+                        trace("SKIP", step.kind .. " " .. step.id .. "; " .. tostring(detail))
+                        S.cursor = S.cursor + 1
+                        -- Не крутим длинную цепочку зависимых пропусков в одном кадре.
+                        task.wait()
+                    else
+                        phase("ERROR", tostring(detail))
+                        stopPlayback()
+                        problem("money-play", "Шаг " .. S.cursor .. ": " .. tostring(detail))
+                        return
+                    end
+                end
+            end)
+            S.pumping = false
+            if not ok and valid() then
+                phase("ERROR", tostring(err))
+                stopPlayback()
+                problem("money-play", err)
+            elseif not valid() and A.phase ~= "DONE" and A.phase ~= "ERROR" then
+                phase("STOPPED", "Отправленные запросы не отзываются")
+            end
+        end)
+    end
+end
+-- КОНЕЦ ЗАМЕНЫ. Следующая исходная строка:
+-- local autoParagraph = Tabs.Macro:AddParagraph({ Title = "Автозапуск макроса", Content = "Инициализация" })
+
+
+    local autoParagraph = Tabs.Macro:AddParagraph({ Title = "Автозапуск макроса", Content = "Инициализация" })
+    Tabs.Macro:AddInput("AutoMacroName", { Title = "Файл автозапуска (без .json)", Default = "", Finished = true })
+    local pick = Tabs.Macro:AddDropdown("AutoMacroPick", {
+        Title = "Выбрать файл автозапуска", Values = {}, Multi = false, AllowNull = true,
+    })
+    Tabs.Macro:AddToggle("AutoMacroEnabled", { Title = "Автозапуск при загрузке матча", Default = false,
+        Description = "Запуск при появлении Stats. Ожидание готовности не расходует попытку. Ошибка файла — без повтора." })
+    Tabs.Macro:AddParagraph({ Title = "Автозапуск и первый запрос",
+        Content = "PLAY_START означает включение плеера. FIRST_SEND — реальную отправку первого шага. " ..
+            "Запрос ждёт порог денег даже при старте по Stats. Одна попытка на показ Stats; " ..
+            "повторный показ внутри матча не перезапускает. После телепорта запустите хаб заново." })
+    local function syncPick(names)
+        A.syncing = true
+        local ok, err = pcall(function()
+            local name, found = opt("AutoMacroName", ""), false
+            for _, candidate in ipairs(names) do if candidate == name then found = true; break end end
+            pick:SetValues(names)
+            pick:SetValue(found and name or nil)
+            pick:Display()
+        end)
+        A.syncing = false
+        if not ok then error(err) end
+    end
+    local originalRefresh = refreshMacros
+    refreshMacros = function(preferred)
+        local names = originalRefresh(preferred)
+        syncPick(names)
+        return names
+    end
+    pick:OnChanged(function(name)
+        if not A.syncing and safeName(name) then options.AutoMacroName:SetValue(name) end
+    end)
+    options.AutoMacroName:OnChanged(function()
+        if not A.syncing then action(refreshMacros)() end
+    end)
+    action(refreshMacros)()
+
+    -- Синхронная загрузка Fluent; AutoMacroEnabled применяется последним.
+    if managersReady and SaveManager then
+        SaveManager:SetIgnoreIndexes({ "AutoMacroPick" })
+        function SaveManager:Load(name)
+            if not safeName(name) then return false, "Недопустимое имя конфига" end
+            if A.loading or A.launching then return false, "Загрузка уже выполняется" end
+            if S.recording or S.playing or S.pumping or S.pending > 0 or S.drainScheduled or next(S.locks) then
+                return false, "Остановите запись/макрос и дождитесь запросов"
+            end
+            A.loading, A.configFailed = true, true
+            local good, err = pcall(function()
+                local path = self.Folder .. "/settings/" .. name .. ".json"
+                assert(isfile(path), "Файл конфига отсутствует")
+                local text = readfile(path)
+                assert(#text <= LIMIT.Bytes, "Конфиг слишком большой")
+                local data = Http:JSONDecode(text)
+                assert(type(data) == "table", "Повреждён конфиг")
+                array(data.objects, 512)
+                local autoName, autoEnabled, seen = "", false, {}
+                for _, entry in ipairs(data.objects) do
+                    assert(type(entry) == "table" and type(entry.idx) == "string"
+                        and type(entry.type) == "string", "Повреждён элемент конфига")
+                    assert(not seen[entry.idx], "Дублирующаяся настройка: " .. entry.idx)
+                    seen[entry.idx] = true
+                    if entry.idx == "AutoMacroName" then
+                        assert(entry.type == "Input" and type(entry.text) == "string"
+                            and (entry.text == "" or safeName(entry.text)), "Неверное имя автомакроса")
+                        autoName = entry.text
+                    elseif entry.idx == "AutoMacroEnabled" then
+                        assert(entry.type == "Toggle" and type(entry.value) == "boolean", "Неверный флаг автомакроса")
+                        autoEnabled = entry.value
+                    elseif entry.idx == "StepDelay" or entry.idx == "CashSyncTimeout" then
+                        local value = tonumber(entry.value)
+                        local low = entry.idx == "StepDelay" and 0 or 0.25
+                        local high = entry.idx == "StepDelay" and 2 or 8
+                        assert(entry.type == "Slider" and finite(value) and value >= low and value <= high,
+                            "Неверный интервал: " .. entry.idx)
+                    end
+                    if self.Options[entry.idx] and not self.Ignore[entry.idx] then
+                        assert(self.Options[entry.idx].Type == entry.type, "Тип настройки не совпадает: " .. entry.idx)
+                    end
+                end
+                options.AutoMacroEnabled:SetValue(false)
+                options.StepDelay:SetValue(0.25)
+                options.CashSyncTimeout:SetValue(2)
+                for _, entry in ipairs(data.objects) do
+                    if entry.idx ~= "AutoMacroName" and entry.idx ~= "AutoMacroEnabled"
+                        and not self.Ignore[entry.idx] then
+                        local parser = self.Parser[entry.type]
+                        if parser and self.Options[entry.idx] then parser.Load(entry.idx, entry) end
+                    end
+                end
+                options.AutoMacroName:SetValue(autoName)
+                refreshMacros()
+                options.AutoMacroEnabled:SetValue(autoEnabled)
+            end)
+            A.loading, A.configFailed = false, not good
+            if not good then
+                pcall(function() options.AutoMacroEnabled:SetValue(false) end)
+                A.status = "Ошибка конфига; автозапуск заблокирован"
+                return false, tostring(err)
+            end
+            return true
+        end
+        -- Upstream LoadAutoloadConfig не возвращает ошибку self:Load вызывающему.
+        -- Здесь сохраняем состояние ошибки для барьера запуска.
+        function SaveManager:LoadAutoloadConfig()
+            local good, loaded, detail = pcall(function()
+                local path = self.Folder .. "/settings/autoload.txt"
+                if not isfile(path) then return true, nil end
+                local name = readfile(path)
+                assert(#name <= 128, "Повреждён autoload.txt")
+                name = name:match("^%s*(.-)%s*$")
+                local ok, err = self:Load(name)
+                return ok, ok and name or err
+            end)
+            if not good or not loaded then
+                A.configFailed = true
+                pcall(function() options.AutoMacroEnabled:SetValue(false) end)
+                problem("autoload-v2", good and detail or loaded)
+                return false
+            end
+            if detail then notify("Конфиг загружен: " .. detail) end
+            return true
+        end
+    end
+
+    local evaluate
+    local function attachWave(obj)
+        if obj == A.waveObject then return end
+        if A.waveConnection then A.waveConnection:Disconnect() end
+        A.waveObject, A.waveConnection = obj, nil
+        if obj then
+            A.waveConnection = obj:GetPropertyChangedSignal("Value"):Connect(function() evaluate() end)
+        end
+    end
+    -- Матч загружен, когда виден GameGui.Info.Stats (без привязки к номеру волны).
+    local function statsVisible()
+        local gui = gameGui()
+        local info = gui and gui:FindFirstChild("Info")
+        return visible(info and info:FindFirstChild("Stats"))
+    end
+    local function userBusy()
+        return S.recording or S.playing or S.pumping or S.pending > 0 or S.drainScheduled
+    end
+    local function attempt()
+        if not A.alive or not S.alive then return end
+        if not A.ready or A.loading then A.status = "Ожидание завершения загрузки конфига"; return end
+        if A.configFailed then A.status = "Ошибка конфига: автозапуск заблокирован"; return end
+        if not opt("AutoMacroEnabled", false) then A.status = "Выключен"; return end
+        -- Вне матча разрешение сбрасывается, чтобы следующий матч мог запуститься.
+        if inConfiguredLobby() then
+            gate.consumed, gate.reason = false, nil
+            A.status = "Лобби: ожидание матча"
+            return
+        end
+        if endVisible() then
+            gate.consumed, gate.reason = false, nil
+            A.status = "Конец матча: ожидание нового матча"
+            return
+        end
+        if not statsVisible() then
+            gate.consumed, gate.reason = false, nil
+            A.status = "Ожидание загрузки матча (Stats)"
+            return
+        end
+        if gate.consumed then
+            A.status = gate.reason or "Попытка этого матча обработана"
+            return
+        end
+        if userBusy() then
+            gate.consumed, gate.reason = true, "Пропуск: ручная запись/воспроизведение уже выполняется"
+            A.status = gate.reason
+            return
+        end
+        -- Недостающая репликация и занятый запрос не расходуют разрешение.
+        local cash = cashNow()
+        if not finite(cash) or cash < 0 or not towers()
+            or not remote("Functions", "SpawnTower", "RemoteFunction")
+            or not remote("Functions", "UpgradeTower", "RemoteFunction")
+            or S.locks.tower or S.workers.elevator then
+            A.status = "Матч загружен: ожидание готовности Cash/Towers/remotes/запроса"
+            return
+        end
+        gate.consumed, gate.reason = true, "Попытка запуска"
+        A.launching = true
+        local ok, err = pcall(function()
+            local name = opt("AutoMacroName", "")
+            assert(fileOK, "Недоступны файловые функции")
+            assert(safeName(name), "Не выбран файл автозапуска")
+            local path = macroPath(name)
+            assert(isfile(path), "Файл отсутствует: " .. path)
+            local text = readfile(path)
+            assert(#text <= LIMIT.Bytes, "Файл макроса слишком большой")
+            local data = validateMacro(Http:JSONDecode(text))
+            assert(#data.steps > 0, "Макрос пуст")
+            assert(data.placeId == game.PlaceId and data.gameId == game.GameId, "Другой PlaceId/GameId")
+            idleRequired()
+            assert(A.alive and S.alive and statsVisible() and not endVisible()
+                and not inConfiguredLobby(), "Матч уже закончился")
+            resetMemory()
+            S.macro = data
+            options.MacroName:SetValue(name)
+            startPlayback()
+            gate.reason = "Запущен " .. name .. "; первая отправка зависит от порога Cash"
+            notify("Автозапуск: " .. name)
+        end)
+        A.launching = false
+        if not ok then
+            gate.reason = "Ошибка автозапуска: " .. tostring(err)
+            problem("auto-macro-v2", gate.reason)
+        end
+        A.status = gate.reason
+    end
+    evaluate = function()
+        if A.evaluating then return end
+        A.evaluating = true
+        local ok, err = pcall(attempt)
+        A.evaluating = false
+        if not ok then
+            A.status = "Ошибка наблюдателя: " .. tostring(err)
+            problem("auto-observer-v2", err)
+        end
+    end
+    local originalDestroy = hub.Destroy
+    hub.Destroy = function(...)
+        A.alive = false
+        if A.waveConnection then A.waveConnection:Disconnect(); A.waveConnection = nil end
+        return originalDestroy(...)
+    end
+    function hub.CompleteAutoMacroStartup()
+        A.ready = true
+        evaluate()
+    end
+    task.defer(function()
+        local lastAuto
+        while A.alive and S.alive and not Fluent.Unloaded do
+            evaluate()
+            local ok, err = pcall(function()
+                if A.status ~= lastAuto then autoParagraph:SetDesc(A.status); lastAuto = A.status end
+                local _, wave = readWave()
+                local step = S.playing and S.macro.steps[S.cursor] or nil
+                local threshold, source
+                if step then threshold, source = stepThreshold(step) end
+                local text = A.phase .. " | " .. A.reason .. "\nWave=" .. tostring(wave)
+                    .. " | Cash=" .. tostring(cashNow()) .. " | шаг=" .. tostring(S.cursor)
+                    .. (step and (" | нужен Cash=" .. threshold .. " (" .. source .. ")") or "")
+                    .. "\nPLAY_START: волна " .. tostring(A.startWave)
+                    .. " | FIRST_SEND: волна " .. tostring(A.firstSentWave)
+                if text ~= A.lastDetail then playbackParagraph:SetDesc(text); A.lastDetail = text end
+            end)
+            if not ok then problem("auto-status-v2", err) end
+            task.wait(0.05)
+        end
+    end)
+end
+-- Slop TD Hub V2: Webhooks, вставка v1.
+-- ВСТАВИТЬ ВНУТРЬ исходного хаба непосредственно ПЕРЕД финальным Window:SelectTab(1),
+-- ПОСЛЕ всего do-блока __STD_AUTOMACRO_ROUND_V2. Ничего из исходного кода не удалять.
+-- НЕ запускать отдельно: используются локальные переменные и функции вашего хаба.
+-- Вкладка создаётся до LoadAutoloadConfig. URL сохраняется обычным SaveManager Input.
+-- Не изменяет hook, Macro Recorder, AntiMacro или игровые remotes.
+-- Auto Leave/Replay задерживаются только этим хабом; ручной выход/телепорт не блокируются.
+-- Политика: одна попытка результата на GameId/PlaceId/JobId/UserId, без HTTP-повторов.
+-- Таймаут HTTP мягкий: отправленный запрос отменить нельзя. Доставка не гарантируется.
+-- Награды: видимые Stats.<имя>.Total; Kills отдельно как статистика.
+-- Стабильность GUI — эвристика, НЕ серверный сигнал завершения выдачи наград.
+-- CurrentSession фиксируется при первом наблюдении EndScreen, не после сетевого ожидания.
+-- В реальном Roblox/Delta этот файл не проверен. Кнопка теста выполняется пользователем.
+do
+    assert(not hub.Webhooks, "Webhooks уже установлены в этом хабе")
+    local W = { alive = true, ready = false, loading = false, status = "Ожидание запуска" }
+    hub.Webhooks = W
+    local KEY = "__STD_WEBHOOK_DELIVERY_V1"
+    local P = G[KEY]
+    if type(P) ~= "table" or P.jobId ~= game.JobId or P.placeId ~= game.PlaceId
+        or P.gameId ~= game.GameId or P.userId ~= LP.UserId then
+        P = { jobId = game.JobId, placeId = game.PlaceId, gameId = game.GameId,
+            userId = LP.UserId, nextHTTP = 0, result = nil, pending = nil, blockedURL = nil }
+        G[KEY] = P
+    end
+    local KNOWN = { Bones = true, Chests = true, Chi = true, Cogs = true, Coins = true,
+        Crystals = true, Gems = true, Kills = true, Sheckles = true, Stars = true, Suns = true }
+    local MIN_SETTLE, QUIET, CAPTURE_TIMEOUT, HTTP_TIMEOUT = 2, 1, 8, 12
+    local DRIVER_NAMES = { "Авто", "request", "http_request", "http.request", "syn.request" }
+    local statusBox
+    local function status(text)
+        W.status = text
+        if W.alive and S.alive and statusBox and W.displayed ~= text then
+            W.displayed = text
+            pcall(function() statusBox:SetDesc(text) end)
+        end
+    end
+
+    -- BEGIN WEBHOOK PURE HELPERS
+    local function trim(s) return (s:match("^%s*(.-)%s*$")) end
+    local function clean(s, rich)
+        if type(s) ~= "string" then return "" end
+        if rich then s = s:gsub("<[^>]->", "") end
+        return trim(s:gsub("[%c]", " "))
+    end
+    local function duration(seconds)
+        if not finite(seconds) or seconds < 0 then return "Недоступно: CurrentSession не найден" end
+        seconds = math.floor(seconds)
+        return string.format("%d:%02d", math.floor(seconds / 60), seconds % 60)
+    end
+    local function endpoint(value)
+        if type(value) ~= "string" then return nil, "Введите URL webhook" end
+        local url = trim(value)
+        if #url > 512 then return nil, "Слишком длинный URL webhook" end
+        local root = url:match("^(.-)%?wait=true$") or url
+        root = root:gsub("/$", "")
+        -- Только обычный Discord webhook, без прокси, thread_id и дополнительных query.
+        local id, token = root:match("^https://discord%.com/api/webhooks/(%d+)/([%w_%-%.]+)$")
+        if not id then
+            id, token = root:match("^https://discord%.com/api/v%d+/webhooks/(%d+)/([%w_%-%.]+)$")
+        end
+        if not id or not token or #id > 24 then
+            return nil, "Нужна прямая HTTPS-ссылка Discord: api/webhooks/ID/TOKEN"
+        end
+        return root .. "?wait=true", id
+    end
+    local function outcome(title)
+        local text = string.lower(trim(title))
+        if text == "victory" or text == "победа" or trim(title) == "Победа" then return "Победа", 3066993 end
+        if text == "defeat" or text == "поражение" or trim(title) == "Поражение" then return "Поражение", 15158332 end
+        return nil
+    end
+    local function stableEnough(r, now)
+        return r.changedAt and now - r.seenAt >= MIN_SETTLE and now - r.changedAt >= QUIET
+    end
+    -- END WEBHOOK PURE HELPERS
+
+    local function chooseHTTP(name)
+        local candidates = {
+            { "request", request }, { "http_request", http_request },
+            { "http.request", type(http) == "table" and http.request or nil },
+            { "syn.request", type(syn) == "table" and syn.request or nil },
+        }
+        for _, pair in ipairs(candidates) do
+            if (name == "Авто" or name == pair[1]) and type(pair[2]) == "function" then
+                return pair[2], pair[1]
+            end
+        end
+        return nil, "Выбранная HTTP-функция недоступна"
+    end
+    local function responseInfo(response)
+        if type(response) ~= "table" then return nil, nil, {} end
+        local code = tonumber(response.StatusCode or response.Status or response.status_code or response.status)
+        if not finite(code) or code % 1 ~= 0 or code < 100 or code > 599 then code = nil end
+        local body = response.Body or response.body
+        local headers = response.Headers or response.headers
+        local decoded
+        if type(body) == "string" and #body <= 65536 then
+            local ok, data = pcall(Http.JSONDecode, Http, body)
+            if ok and type(data) == "table" then decoded = data end
+        end
+        return code, decoded, type(headers) == "table" and headers or {}
+    end
+    local function headerNumber(headers, name)
+        for k, v in pairs(headers) do
+            if type(k) == "string" and k:lower() == name then
+                local n = tonumber(v)
+                if finite(n) and n >= 0 then return n end
+            end
+        end
+        return nil
+    end
+    local function applyRateLimit(code, data, headers)
+        local waitFor
+        if code == 429 then
+            local bodyWait = data and tonumber(data.retry_after)
+            if not finite(bodyWait) or bodyWait < 0 then bodyWait = 0 end
+            waitFor = math.max(bodyWait, headerNumber(headers, "retry-after") or 0,
+                headerNumber(headers, "x-ratelimit-reset-after") or 0)
+            -- Если сервер не сообщил срок, запрещаем следующие тесты до перезапуска сессии.
+            if waitFor <= 0 then P.nextHTTP = math.huge; return end
+        elseif headerNumber(headers, "x-ratelimit-remaining") == 0 then
+            waitFor = headerNumber(headers, "x-ratelimit-reset-after")
+        end
+        if waitFor then P.nextHTTP = math.max(P.nextHTTP, os.clock() + waitFor + 0.25) end
+    end
+    local function finish(r, text)
+        r.finished, r.message = true, text
+        status(text)
+    end
+    local function tickTicket(ticket)
+        if not ticket.done and os.clock() - ticket.started >= HTTP_TIMEOUT then
+            if not ticket.timedOut then
+                ticket.timedOut = true
+                ticket.message = "HTTP: таймаут; исход неизвестен, повтор не выполняется"
+            end
+        end
+        return ticket.done or ticket.timedOut
+    end
+    local function send(body, url, webhookId, fn, driver, result)
+        if P.pending then return nil, "Предыдущий HTTP-запрос ещё выполняется" end
+        if P.blockedURL == url then return nil, "Этот webhook вернул HTTP 401/403/404; замените URL" end
+        if os.clock() < P.nextHTTP then return nil, "Ожидание после ограничения Discord; повтор не отправлен" end
+        local ticket = { started = os.clock(), done = false, driver = driver }
+        P.pending = ticket
+        if result then
+            -- До task.spawn и вызова HTTP: повторный запуск хаба не повторит POST.
+            result.attempted, result.ticket = true, ticket
+        end
+        task.spawn(function()
+            local ok, response = pcall(fn, {
+                Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body,
+            })
+            -- Не печатаем response или исключение: исполнитель может включить в них секретный URL.
+            local parsed, failure = pcall(function()
+                if not ok then
+                    ticket.message = "HTTP-исключение; исход неизвестен, автоповтора нет"
+                    return
+                end
+                local code, data, headers = responseInfo(response)
+                ticket.code = code
+                applyRateLimit(code, data, headers)
+                if code == 200 and data and type(data.id) == "string" and data.id:match("^%d+$")
+                    and data.webhook_id == webhookId then
+                    ticket.confirmed, ticket.messageId = true, data.id
+                    ticket.message = "Discord подтвердил сообщение; HTTP 200; API: " .. driver
+                elseif code == 401 or code == 403 or code == 404 then
+                    P.blockedURL = url
+                    ticket.message = "Discord: HTTP " .. code .. "; URL заблокирован для следующих отправок"
+                elseif code == 429 then
+                    ticket.message = "Discord: HTTP 429; лимит запросов, автоповтора нет"
+                elseif code and code >= 400 and code < 500 then
+                    ticket.message = "Discord отклонил запрос: HTTP " .. code .. "; автоповтора нет"
+                elseif code then
+                    ticket.message = "HTTP " .. code .. ": доставка не подтверждена; автоповтора нет"
+                else
+                    ticket.message = "Неизвестный формат HTTP-ответа; доставка не подтверждена"
+                end
+            end)
+            if not parsed then ticket.message = "Ошибка разбора HTTP-ответа; доставка не подтверждена" end
+            response, failure = nil, nil
+            ticket.done = true
+            if P.pending == ticket then P.pending = nil end
+            if result then
+                result.finished, result.message = true, ticket.message
+            end
+            if W.alive and S.alive then status(ticket.message) end
+        end)
+        return ticket
+    end
+    local function sessionSeconds()
+        local value = LP:FindFirstChild("CurrentSession")
+        if value and (value:IsA("IntValue") or value:IsA("NumberValue")) then
+            local n = value.Value
+            if finite(n) and n >= 0 then return n end
+        end
+        return nil
+    end
+    local function endingFrame()
+        local gui = gameGui()
+        return gui and gui:FindFirstChild("EndScreen")
+    end
+    local function readResult(frame)
+        if not visible(frame) then return nil, "EndScreen скрыт" end
+        local content = frame:FindFirstChild("Content")
+        local title = content and content:FindFirstChild("Title")
+        local stats = frame:FindFirstChild("Stats")
+        if not title or not title:IsA("TextLabel") or not visible(title) or not visible(stats) then
+            return nil, "Ожидание Title/Stats"
+        end
+        local titleText = clean(title.Text, title.RichText)
+        local result, color = outcome(titleText)
+        if not result then return nil, "Неизвестный заголовок результата" end
+        local cards, seen = {}, {}
+        for _, card in ipairs(stats:GetChildren()) do
+            if card:IsA("Frame") then
+                local total = card:FindFirstChild("Total")
+                if total or KNOWN[card.Name] then
+                    local shown = visible(card)
+                    local readable = total and total:IsA("TextLabel")
+                    local totalShown = readable and visible(total) or false
+                    local text = readable and clean(total.Text, total.RichText) or ""
+                    if seen[card.Name] then return nil, "Повторное имя карточки наград" end
+                    seen[card.Name] = true
+                    if shown and (not totalShown or text == "" or text == "-" or text == "--") then
+                        return nil, "Ожидание Total у видимой карточки"
+                    end
+                    if #card.Name > 80 or #text > 160 then return nil, "Слишком длинная карточка наград" end
+                    cards[#cards + 1] = { name = card.Name, text = text, shown = shown, totalShown = totalShown }
+                end
+            end
+        end
+        if #cards == 0 then return nil, "Карточки Stats ещё не созданы" end
+        table.sort(cards, function(a, b) return a.name < b.name end)
+        local rewards, statistics, signature = {}, {}, { titleText }
+        for _, card in ipairs(cards) do
+            -- В сигнатуру включены и скрытые карточки: их обновления тоже продлевают ожидание.
+            signature[#signature + 1] = { card.name, card.text, card.shown, card.totalShown }
+            if card.shown and card.totalShown then
+                local rows = card.name == "Kills" and statistics or rewards
+                rows[#rows + 1] = card.name .. ": " .. card.text
+            end
+        end
+        return { result = result, color = color, rewards = rewards, statistics = statistics,
+            signature = Http:JSONEncode(signature) }
+    end
+    local function makeBody(snapshot, r)
+        local rewards = #snapshot.rewards > 0 and table.concat(snapshot.rewards, "\n")
+            or "Нет видимых карточек наград"
+        local statistics = table.concat(snapshot.statistics, "\n")
+        -- Лимиты по байтам консервативнее лимитов Discord по символам. Не обрезаем награды молча.
+        if #rewards > 1000 or #statistics > 1000 then return nil, "Награды не помещаются в сообщение; отправка отменена" end
+        local player = LP.Name
+        if LP.DisplayName ~= LP.Name then player = player .. " (" .. LP.DisplayName .. ")" end
+        local timing = duration(r.seconds) .. "\nИсточник: CurrentSession при появлении EndScreen"
+        if r.late then timing = timing .. "\nХаб загружен при открытом результате: время снято позднее" end
+        local fields = {
+            { name = "Игрок", value = player, inline = false },
+            { name = "Время сессии", value = timing, inline = false },
+            { name = "Награды на итоговом экране", value = rewards, inline = false },
+        }
+        if statistics ~= "" then fields[#fields + 1] = { name = "Статистика", value = statistics, inline = false } end
+        local payload = { embeds = {{ title = "Slop Tower Defense — " .. snapshot.result,
+            color = snapshot.color, fields = fields,
+            footer = { text = "Данные видимых карточек после стабилизации GUI" } }} }
+        -- Literal []: не зависим от того, кодирует ли HttpService пустую Luau-таблицу как [] или {}.
+        return '{"allowed_mentions":{"parse":[]},"embeds":' .. Http:JSONEncode(payload.embeds) .. '}'
+    end
+
+    Tabs.Webhooks = Window:AddTab({ Title = "Webhooks", Icon = "" })
+    local tab = Tabs.Webhooks
+    tab:AddInput("WebhookURL", { Title = "Discord webhook URL", Default = "", Finished = false,
+        Description = "Прямая ссылка обычного текстового канала. Сохраняется в конфиге открытым текстом." })
+    tab:AddDropdown("WebhookHTTP", { Title = "HTTP API исполнителя", Values = DRIVER_NAMES, Default = "Авто" })
+    tab:AddToggle("WebhookEnabled", { Title = "Отправлять победу / поражение", Default = false })
+    tab:AddSlider("WebhookEndWait", { Title = "Максимум ожидания перед Auto Leave / Replay, секунд",
+        Default = 20, Min = 5, Max = 30, Rounding = 0 })
+    statusBox = tab:AddParagraph({ Title = "Статус Webhook", Content = W.status })
+    tab:AddParagraph({ Title = "Что отправляется", Content =
+        "Результат, ник, все видимые Stats.<имя>.Total и CurrentSession в минутах:секундах. " ..
+        "Скрытые карточки не считаются выданными наградами; Kills выводится отдельно. " ..
+        "Таймер не пересчитывается через SpeedGame; это время сессии, включая время до первой волны." })
+    tab:AddParagraph({ Title = "Ожидание и ошибки", Content =
+        "Одна попытка на серверную сессию. Перед отправкой: минимум 2 секунды и 1 секунда без изменений. " ..
+        "Ожидание данных до 8 секунд, HTTP до 12 секунд; общий предел задаётся выше. " ..
+        "После ошибки/таймаута Auto Leave/Replay разрешены. Ручной выход не блокируется. " ..
+        "Нет повторов результата, fallback после POST и переноса недоставленного сообщения в следующий сервер." })
+    tab:AddParagraph({ Title = "Конфиг", Content =
+        "После ввода URL и включения переключателя сохраните/перезапишите конфиг в Configs. " ..
+        "Для следующего сервера нужен autoload и повторный запуск самого хаба. " ..
+        "Тест — отдельное сообщение, не награда и не повтор результата." })
+    button(tab, "Показать доступные HTTP API", function()
+        local found = {}
+        for _, name in ipairs(DRIVER_NAMES) do
+            if name ~= "Авто" and chooseHTTP(name) then found[#found + 1] = name end
+        end
+        status(#found > 0 and ("Найдены: " .. table.concat(found, ", ") .. ". Работоспособность ещё не проверена.")
+            or "HTTP API отсутствует в этом исполнителе")
+    end)
+    button(tab, "Отправить тест в Discord", function()
+        confirm("Тест Discord webhook", "Отправить одно тестовое сообщение в указанный канал?", function()
+            if not W.ready or W.loading then status("Дождитесь загрузки конфига"); return end
+            local frame = endingFrame()
+            if visible(frame) or (P.result and not P.result.finished) then
+                status("Тест заблокирован во время обработки EndScreen"); return
+            end
+            local url, id = endpoint(opt("WebhookURL", ""))
+            if not url then status(id); return end
+            local fn, driver = chooseHTTP(opt("WebhookHTTP", "Авто"))
+            if not fn then status(driver); return end
+            local body = '{"allowed_mentions":{"parse":[]},"content":'
+                .. Http:JSONEncode("Slop TD Hub: тест HTTP API. Это не результат матча.") .. '}'
+            local ticket, err = send(body, url, id, fn, driver)
+            if not ticket then status(err); return end
+            W.testTicket = ticket
+            status("Тестовый запрос отправлен через " .. driver)
+        end)
+    end)
+
+    local function observe(frame, late)
+        if P.result or not visible(frame) then return end
+        -- Таймер снимается даже до готовности конфига; конфигурация отправки читается позже.
+        P.result = { seenAt = os.clock(), seconds = sessionSeconds(), late = late == true,
+            attempted = false, finished = false, message = "Сбор наград" }
+    end
+    local function process(frame)
+        local r = P.result
+        if not r then return false end
+        if r.ticket then
+            if tickTicket(r.ticket) then finish(r, r.ticket.message) end
+        end
+        if r.finished then status(r.message); return false end
+        if not W.ready or W.loading then return true end
+        if not r.configured then
+            r.configured = true
+            local wait = tonumber(opt("WebhookEndWait", 20))
+            if not finite(wait) then wait = 20 end
+            r.releaseAt = r.seenAt + math.clamp(wait, 5, 30)
+            if not opt("WebhookEnabled", false) then finish(r, "Webhook выключен: результат пропущен"); return false end
+            local url, id = endpoint(opt("WebhookURL", ""))
+            if not url then finish(r, id); return false end
+            local fn, driver = chooseHTTP(opt("WebhookHTTP", "Авто"))
+            if not fn then finish(r, driver); return false end
+            r.url, r.webhookId, r.fn, r.driver = url, id, fn, driver
+        end
+        if not opt("WebhookEnabled", false) then
+            finish(r, r.attempted and "Webhook выключен; отправленный запрос не отменён" or "Webhook выключен: отправка отменена")
+            return false
+        end
+        local now = os.clock()
+        if now >= r.releaseAt then
+            finish(r, r.attempted and "Предел ожидания выхода; исход HTTP неизвестен, повтора нет"
+                or "Предел ожидания выхода; webhook не отправлен")
+            return false
+        end
+        if r.attempted then status("Ожидание ответа Discord"); return true end
+        if not visible(frame) then finish(r, "EndScreen исчез до снимка; webhook не отправлен"); return false end
+        if now - r.seenAt >= CAPTURE_TIMEOUT then
+            finish(r, "Награды не готовы: " .. (r.lastReason or "истёк срок стабилизации"))
+            return false
+        end
+        local snapshot, reason = readResult(frame)
+        if not snapshot then
+            r.signature, r.changedAt, r.lastReason = nil, nil, reason
+            status(reason)
+            return true
+        end
+        if r.signature ~= snapshot.signature then r.signature, r.changedAt = snapshot.signature, now end
+        if not stableEnough(r, now) then status("Ожидание стабильных наград"); return true end
+        local body, err = makeBody(snapshot, r)
+        if not body then finish(r, err); return false end
+        if P.pending or now < P.nextHTTP then status("Ожидание HTTP API / ограничения Discord"); return true end
+        local ticket, sendError = send(body, r.url, r.webhookId, r.fn, r.driver, r)
+        r.url, r.fn = nil, nil
+        if not ticket then finish(r, sendError); return false end
+        status("Результат отправлен; ожидается подтверждение Discord")
+        return true
+    end
+
+    -- Одна точка входа: существующий safeCycle("end", endCycle) теперь сначала обрабатывает webhook.
+    -- Старый endCycle с приоритетом AutoLeave сохранён и вызывается только после барьера.
+    local originalEndCycle = endCycle
+    endCycle = function()
+        if not W.alive then return originalEndCycle() end
+        local frame = endingFrame()
+        observe(frame, false)
+        if visible(frame) then
+            if S.playing then stopPlayback("Матч завершён; макрос остановлен") end
+            if S.recording then S.recording = false; notify("Матч завершён; запись остановлена") end
+        end
+        if W.testTicket then
+            if tickTicket(W.testTicket) then status(W.testTicket.message); W.testTicket = nil end
+        end
+        local ok, hold = pcall(process, frame)
+        if not ok then
+            -- Не выводим текст исключения, потенциально содержащий URL.
+            if P.result then finish(P.result, "Ошибка модуля webhook; отправка не повторяется") end
+            hold = false
+        end
+        if not W.ready or W.loading or hold then return end
+        return originalEndCycle()
+    end
+
+    -- Более ранний снимок таймера по Visible; полное effective-проверяется observe().
+    local function attach(frame)
+        if frame == W.frame then return end
+        if W.connection then W.connection:Disconnect(); W.connection = nil end
+        W.frame = frame
+        if frame and frame:IsA("GuiObject") then
+            W.connection = frame:GetPropertyChangedSignal("Visible"):Connect(function()
+                if W.alive and S.alive then observe(frame, false) end
+            end)
+        end
+    end
+    attach(endingFrame())
+    observe(endingFrame(), true)
+    local baseCycle = endCycle
+    endCycle = function()
+        attach(endingFrame())
+        return baseCycle()
+    end
+
+    -- Существующий synchronous Load из автомакроса сохраняется. Webhook при загрузке не работает.
+    if managersReady and SaveManager then
+        local originalLoad = SaveManager.Load
+        function SaveManager:Load(name)
+            if W.loading or not safeName(name) then return false, "Недопустимое имя / конфиг загружается" end
+            if S.recording or S.playing or S.pumping or S.pending > 0 or S.drainScheduled or next(S.locks)
+                or (W.ready and P.result and not P.result.finished) then
+                return false, "Дождитесь остановки операций и обработки результата"
+            end
+            W.loading = true
+            local ok, loaded, detail = pcall(function()
+                -- Старые конфиги без Webhook-полей не наследуют URL/Enabled от предыдущего.
+                options.WebhookEnabled:SetValue(false)
+                options.WebhookURL:SetValue("")
+                options.WebhookHTTP:SetValue("Авто")
+                options.WebhookEndWait:SetValue(20)
+                return originalLoad(self, name)
+            end)
+            if not ok or not loaded then
+                pcall(function() options.WebhookEnabled:SetValue(false) end)
+            end
+            W.loading = false
+            if not ok then return false, "Ошибка загрузки конфига; webhook выключен" end
+            return loaded, detail
+        end
+    end
+    local originalStartup = hub.CompleteAutoMacroStartup
+    hub.CompleteAutoMacroStartup = function(...)
+        local results = table.pack(originalStartup(...))
+        W.ready = true
+        status("Готов. Тест HTTP API ещё не выполнялся этим модулем.")
+        return table.unpack(results, 1, results.n)
+    end
+    local originalDestroy = hub.Destroy
+    hub.Destroy = function(...)
+        W.alive = false
+        if W.connection then W.connection:Disconnect(); W.connection = nil end
+        if P.result and not P.result.attempted and not P.result.finished then
+            P.result.finished, P.result.message = true, "Хаб выгружен до отправки; результат пропущен"
+        end
+        -- P и ticket сохраняются: запрос мог уже попасть в Discord. Его нельзя повторять.
+        return originalDestroy(...)
+    end
+end
+
+do
+    -- Конфиги по аккаунтам: отдельная папка настроек Fluent на каждый UserId.
+    -- Общая папка сохраняется для совместимости; тема и макросы остаются общими.
+    if hub.CPA then return end
+    local CPA = { alive = true, perAccount = false }
+    hub.CPA = CPA
+
+    if not fileOK or not managersReady or not SaveManager then
+        Tabs.Configs:AddParagraph({ Title = "Конфиги по аккаунтам", Content =
+            "Недоступно: нужны файловые функции и менеджер конфигов." })
+        return
+    end
+
+    -- Путь к глобальному флагу режима; сам флаг общий для всех аккаунтов.
+    local function modePath() return ROOT .. "/cpa_mode.txt" end
+    -- Общая папка конфигов (старое поведение).
+    local function globalFolder() return ROOT .. "/configs" end
+    -- Папка текущего аккаунта; только UserId, ник может содержать небезопасные символы.
+    local function accountFolder() return ROOT .. "/configs/accounts/" .. tostring(LP.UserId) end
+
+    -- Читаем сохранённый режим; при отсутствии файла остаёмся в общем режиме.
+    do
+        local ok, stored = pcall(function()
+            if isfile(modePath()) then return readfile(modePath()) end
+            return nil
+        end)
+        if ok and type(stored) == "string" then
+            local t = stored:match("^%s*(.-)%s*$"):lower()
+            CPA.perAccount = (t == "1" or t == "true" or t == "peraccount" or t == "per-account")
+        end
+    end
+
+    local cpaStatus = Tabs.Configs:AddParagraph({ Title = "Конфиги по аккаунтам", Content = "Инициализация" })
+    local cpaToggle = Tabs.Configs:AddToggle("CPA_PerAccount", {
+        Title = "Конфиги отдельно для каждого аккаунта",
+        Description = "Вкл: папка accounts/<UserId>. Выкл: общая папка configs. Список ниже обновляется сам.",
+        Default = CPA.perAccount,
+    })
+    -- Зеркало списка файлов настройкой не является; сам переключатель тоже не сохраняем в конфиг.
+    SaveManager:SetIgnoreIndexes({ "CPA_PerAccount" })
+
+    -- Текущий автозагрузочный конфиг именно из активной папки.
+    local function describeAutoload()
+        local ok, text = pcall(function()
+            local path = SaveManager.Folder .. "/settings/autoload.txt"
+            if isfile(path) then return readfile(path) end
+            return nil
+        end)
+        if not ok or type(text) ~= "string" then return "нет" end
+        text = text:match("^%s*(.-)%s*$")
+        return text ~= "" and text or "нет"
+    end
+
+    -- Обновляет статусный параграф; ошибок наружу не бросает.
+    local function updateStatus()
+        local ok, names = pcall(function() return SaveManager:RefreshConfigList() end)
+        local count = (ok and type(names) == "table") and #names or 0
+        local text = "Аккаунт: " .. tostring(LP.Name) .. " (" .. tostring(LP.UserId) .. ")"
+            .. "\nРежим: " .. (CPA.perAccount and "по аккаунтам" or "общий")
+            .. "\nПапка: " .. tostring(SaveManager.Folder)
+            .. "\nКонфигов: " .. tostring(count)
+            .. "\nАвтозагрузка: " .. describeAutoload()
+        pcall(function() cpaStatus:SetDesc(text) end)
+    end
+
+    -- Ядро: выставить правильную папку и освежить список дропдауна.
+    function CPA.applySilent()
+        local folder = CPA.perAccount and accountFolder() or globalFolder()
+        ensureFolder(folder .. "/settings")
+        SaveManager:SetFolder(folder)
+        pcall(function()
+            local names = SaveManager:RefreshConfigList()
+            local dd = SaveManager.Options and SaveManager.Options.SaveManager_ConfigList
+            if dd then
+                dd:SetValues(names)
+                dd:SetValue(nil)
+            end
+        end)
+        updateStatus()
+    end
+
+    cpaToggle:OnChanged(function(value)
+        if not CPA.alive or not S.alive then return end
+        local ok, err = pcall(function()
+            CPA.perAccount = (value == true)
+            ensureFolder(ROOT)
+            writefile(modePath(), CPA.perAccount and "1" or "0")
+            CPA.applySilent()
+        end)
+        if not ok then
+            problem("cpa", err)
+        else
+            notify(CPA.perAccount and "Режим: конфиги по аккаунтам" or "Режим: общие конфиги")
+        end
+    end)
+
+    button(Tabs.Configs, "Обновить список конфигов (папка аккаунта)", function()
+        CPA.applySilent()
+    end, "Перечитывает активную папку и обновляет Config list.")
+
+    -- Обёртки поверх существующих Load/Save: сначала правильная папка, потом оригинал.
+    local origSave = SaveManager.Save
+    function SaveManager:Save(name)
+        if CPA.alive and S.alive then pcall(function() CPA.applySilent() end) end
+        return origSave(self, name)
+    end
+    local origLoad = SaveManager.Load
+    function SaveManager:Load(name)
+        if CPA.alive and S.alive then pcall(function() CPA.applySilent() end) end
+        return origLoad(self, name)
+    end
+    local origAutoload = SaveManager.LoadAutoloadConfig
+    function SaveManager:LoadAutoloadConfig()
+        if CPA.alive and S.alive then pcall(function() CPA.applySilent() end) end
+        return origAutoload(self)
+    end
+
+    local origDestroy = hub.Destroy
+    hub.Destroy = function(...)
+        CPA.alive = false
+        return origDestroy(...)
+    end
+
+    -- Стартовое применение до LoadAutoloadConfig в секции запуска.
+    pcall(function() CPA.applySilent() end)
+end
+
+do
+    -- Командный автозапуск: заход в лифт только полной командой, старт не нажимаем.
+    -- Survival-команда всегда Elevator7, Raid-команда всегда Elevator1.
+    if hub.Team then return end
+    local T = { alive = true, lastPoll = -math.huge, lastEnter = -math.huge,
+        lastStage = -math.huge, matchSince = nil, lastKick = -math.huge, status = "Инициализация" }
+    hub.Team = T
+
+    -- Аддитивные данные лифта из сообщения пользователя, литералы выше не трогаем.
+    if ELEVATOR_POS.Elevator7 == nil then
+        ELEVATOR_POS.Elevator7 = Vector3.new(59, 61, 113)
+    end
+    do
+        local has7 = false
+        for _, n in ipairs(ELEVATORS) do if n == "Elevator7" then has7 = true; break end end
+        if not has7 then ELEVATORS[#ELEVATORS + 1] = "Elevator7" end
+    end
+
+    -- Разбор имён через запятую/пробел/точку с запятой.
+    local function splitNames(s)
+        local out = {}
+        if type(s) ~= "string" then return out end
+        for tok in s:gsub("[,;]+", " "):gmatch("%S+") do out[#out + 1] = tok end
+        return out
+    end
+    -- Ник Roblox: латиница/цифры/подчёркивание, 3-20 символов.
+    local function validName(n)
+        return type(n) == "string" and #n >= 3 and #n <= 20 and n:match("^[%w_]+$") ~= nil
+    end
+    -- Вайтлист без самого себя (регистр не важен), дубликаты убираются.
+    local function whitelist()
+        local seen, out, bad = {}, {}, 0
+        for _, tok in ipairs(splitNames(opt("TeamWhitelist", ""))) do
+            if validName(tok) then
+                local k = tok:lower()
+                if k ~= LP.Name:lower() and not seen[k] then seen[k] = true; out[#out + 1] = tok end
+            else bad = bad + 1 end
+        end
+        return out, bad
+    end
+    -- Карта игроков сервера по нижнему регистру имени.
+    local function playersByName()
+        local map = {}
+        local ok, list = pcall(function() return Players:GetPlayers() end)
+        if ok and type(list) == "table" then
+            for _, p in ipairs(list) do
+                if typeof(p) == "Instance" and p:IsA("Player") then map[p.Name:lower()] = p end
+            end
+        end
+        return map
+    end
+    -- Позиция персонажа без исключений наружу.
+    local function charPos(player)
+        local ok, pos = pcall(function()
+            local ch = player and player.Character
+            if not ch then return nil end
+            local hrp = ch:FindFirstChild("HumanoidRootPart")
+            if hrp and hrp:IsA("BasePart") then return hrp.Position end
+            return ch:GetPivot().Position
+        end)
+        return ok and pos or nil
+    end
+    local function selfHrp()
+        local ch = LP.Character
+        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        return (hrp and hrp:IsA("BasePart")) and hrp or nil
+    end
+    -- Центр зоны из строки "x, y, z"; при мусоре возвращается зона по умолчанию.
+    local function parseZone()
+        local raw = opt("TeamZone", "68.5, 62.3, 87.6")
+        if type(raw) == "string" then
+            local nums = {}
+            for n in raw:gmatch("[-+]?%d+%.?%d*") do nums[#nums + 1] = tonumber(n) end
+            if #nums >= 3 and finite(nums[1]) and finite(nums[2]) and finite(nums[3]) then
+                return Vector3.new(nums[1], nums[2], nums[3])
+            end
+        end
+        return Vector3.new(68.5, 62.3, 87.6)
+    end
+    local function numOpt(id, fallback, low, high)
+        local v = tonumber(opt(id, fallback))
+        if not finite(v) then v = fallback end
+        return math.clamp(v, low, high)
+    end
+
+    local teamStatus = Tabs.Lobby:AddParagraph({ Title = "Командный автозапуск", Content = "Инициализация" })
+    Tabs.Lobby:AddToggle("TeamEnabled", { Title = "Командный автозапуск (по вайтлисту)", Default = false,
+        Description = "В лобби ждёт союзников и зону, заходит в командный лифт без Start. В матче кикает при неполной команде." })
+    Tabs.Lobby:AddInput("TeamWhitelist", { Title = "Союзники (имена через запятую)", Finished = true,
+        Default = "fewit1i032, cepit6J729, cepit1b713, cepitb0494" })
+    Tabs.Lobby:AddInput("TeamAdd", { Title = "Добавить / убрать имя", Default = "", Finished = true,
+        Description = "Вспомогательное поле, в конфиг не сохраняется." })
+    Tabs.Lobby:AddSlider("TeamPoll", { Title = "Опрос готовности, секунд", Default = 3, Min = 1, Max = 10, Rounding = 0 })
+    Tabs.Lobby:AddSlider("TeamGrace", { Title = "Грейс в матче до кика, секунд", Default = 20, Min = 5, Max = 60, Rounding = 0 })
+    Tabs.Lobby:AddToggle("TeamUseZone", { Title = "Требовать общую зону перед лифтом", Default = true,
+        Description = "Выкл — ждём только загрузку персонажей союзников." })
+    Tabs.Lobby:AddInput("TeamZone", { Title = "Центр зоны (x, y, z)", Default = "68.5, 62.3, 87.6", Finished = true })
+    Tabs.Lobby:AddSlider("TeamZoneR", { Title = "Радиус зоны", Default = 7, Min = 3, Max = 30, Rounding = 0 })
+    if managersReady and SaveManager then
+        SaveManager:SetIgnoreIndexes({ "TeamAdd" })
+    end
+
+    local function setStatus(text)
+        T.status = text
+        pcall(function() teamStatus:SetDesc(text) end)
+    end
+
+    button(Tabs.Lobby, "Добавить имя в вайтлист", function()
+        local cur = splitNames(opt("TeamWhitelist", ""))
+        local have = {}
+        for _, n in ipairs(cur) do have[n:lower()] = true end
+        for _, tok in ipairs(splitNames(opt("TeamAdd", ""))) do
+            assert(validName(tok), "Некорректное имя: " .. tostring(tok))
+            if tok:lower() ~= LP.Name:lower() and not have[tok:lower()] then
+                have[tok:lower()] = true; cur[#cur + 1] = tok
+            end
+        end
+        options.TeamWhitelist:SetValue(table.concat(cur, ", "))
+        options.TeamAdd:SetValue("")
+        notify("Вайтлист обновлён")
+    end)
+    button(Tabs.Lobby, "Убрать имя из вайтлиста", function()
+        local drop = {}
+        for _, tok in ipairs(splitNames(opt("TeamAdd", ""))) do drop[tok:lower()] = true end
+        local cur = {}
+        for _, n in ipairs(splitNames(opt("TeamWhitelist", ""))) do
+            if not drop[n:lower()] then cur[#cur + 1] = n end
+        end
+        options.TeamWhitelist:SetValue(table.concat(cur, ", "))
+        options.TeamAdd:SetValue("")
+        notify("Вайтлист обновлён")
+    end)
+    button(Tabs.Lobby, "Очистить вайтлист", function()
+        options.TeamWhitelist:SetValue("")
+        options.TeamAdd:SetValue("")
+        notify("Вайтлист очищен")
+    end)
+
+    -- Лобби: ждём сервер, зону/загрузку, затем телепорт и Enter без Start.
+    local function lobbyPhase(now)
+        local allies, bad = whitelist()
+        if #allies == 0 then setStatus("Вайтлист пуст (без себя)" .. (bad > 0 and "; мусорных: " .. bad or "")); return end
+        local byName = playersByName()
+        local missing = {}
+        for _, n in ipairs(allies) do if not byName[n:lower()] then missing[#missing + 1] = n end end
+        if #missing > 0 then
+            setStatus("Ждём на сервере " .. (#allies - #missing) .. "/" .. #allies .. ": " .. table.concat(missing, ", "))
+            return
+        end
+        if S.recording or S.playing then setStatus("Пауза: идёт запись/макрос"); return end
+        local hrp = selfHrp()
+        if not hrp then setStatus("Ждём загрузку своего персонажа"); return end
+        local elev = (opt("LobbyMode", "Survival") == "Raid") and "Elevator1" or "Elevator7"
+        local epos = ELEVATOR_POS[elev]
+        if not epos then setStatus("Нет координат лифта " .. elev); return end
+        -- Уже у лифта и недавно заходили: не спамим, ждём автостарт 10 с.
+        if (hrp.Position - epos).Magnitude < 12 and now - T.lastEnter < 15 then
+            setStatus("В лифте " .. elev .. ", ждём автостарт; союзники на сервере: " .. #allies .. "/" .. #allies)
+            return
+        end
+                -- Союзник готов, если в зоне или уже у целевого лифта (иначе staggered-входы встанут).
+        local function allyReady(name, byName, center, r, epos)
+            local pos = charPos(byName[name:lower()])
+            if not pos then return false end
+            if (pos - center).Magnitude <= r then return true end
+            return (pos - epos).Magnitude < 12
+        end
+        -- Физический вход: телепорт, шаги в радиусе 3 для репликации, затем Enter. Без Start.
+        local function beginEnter(elev, epos)
+            if T.entering then return end
+            T.entering = true
+            task.spawn(function()
+                local ok, err = pcall(function()
+                    if not (T.alive and S.alive) then return end
+                    local hrp0 = selfHrp()
+                    if not hrp0 then return end
+                    hrp0.CFrame = CFrame.new(epos)
+                    -- Шаги с амплитудой не более 3 от координат лифта.
+                    local steps = { Vector3.new(2, 0, 0), Vector3.new(-2, 0, 1.5),
+                        Vector3.new(1, 0, -2), Vector3.new(0, 0, 0) }
+                    for _, off in ipairs(steps) do
+                        if not (T.alive and S.alive) then return end
+                        local hrp = selfHrp()
+                        if not hrp then return end
+                        hrp.CFrame = CFrame.new(epos + off)
+                        task.wait(0.12)
+                    end
+                    if not (T.alive and S.alive) then return end
+                    local okFire, msg = fire("Events", "EnterElevator", elev)
+                    if not okFire then problem("team-enter", msg or elev); return end
+                    T.lastEnter = os.clock()
+                end)
+                T.entering = false
+                if not ok and T.alive and S.alive then problem("team", err) end
+            end)
+        end
+        local poll = numOpt("TeamPoll", 0.6, 0.5, 10)
+        local delay = numOpt("TeamEnterDelay", 5, 0, 15)
+        if opt("TeamUseZone", true) then
+            local center, r = parseZone(), numOpt("TeamZoneR", 7, 3, 30)
+            local selfIn = (hrp.Position - center).Magnitude <= r
+                or (hrp.Position - epos).Magnitude < 12
+            -- Себя всегда сначала стягиваем в зону, даже если союзники уже там.
+            if not selfIn then
+                T.readySince = nil
+                if now - T.lastStage >= poll then
+                    T.lastStage = now
+                    hrp.CFrame = CFrame.new(center)
+                end
+                setStatus("Идём в зону, затем общий таймер")
+                return
+            end
+            local outside = {}
+            for _, n in ipairs(allies) do
+                if not allyReady(n, byName, center, r, epos) then outside[#outside + 1] = n end
+            end
+            if #outside > 0 then
+                T.readySince = nil
+                setStatus("Зона: вне её " .. #outside .. "/" .. #allies .. ": " .. table.concat(outside, ", "))
+                return
+            end
+        else
+            for _, n in ipairs(allies) do
+                if not charPos(byName[n:lower()]) then
+                    T.readySince = nil
+                    setStatus("Ждём загрузку персонажа: " .. n); return
+                end
+            end
+        end
+        -- Все готовы: общий таймер для всех, затем один вход через воркер.
+        if delay <= 0 then
+            T.readySince = nil
+            if not T.entering then beginEnter(elev, epos) end
+            setStatus("Готовы, входим в " .. elev .. "; Start не нажимаем")
+            return
+        end
+        if not T.readySince then T.readySince = now end
+        local left = math.max(0, math.ceil(T.readySince + delay - now))
+        if left > 0 then
+            setStatus("Готовы " .. #allies .. "/" .. #allies .. "; вход через " .. left .. " с")
+            return
+        end
+        T.readySince = nil
+        if not T.entering then beginEnter(elev, epos) end
+        setStatus("Зашли в " .. elev .. "; автостарт ~10 с, Start не нажимаем")
+    end
+
+    -- Матч: грейс на появление всех, иначе кик для перезахода через Reconnect.
+    local function matchPhase(now)
+        local allies = whitelist()
+        if #allies == 0 then return end
+        if not T.matchSince then T.matchSince = now end
+        local byName = playersByName()
+        local missing = {}
+        for _, n in ipairs(allies) do if not byName[n:lower()] then missing[#missing + 1] = n end end
+        if #missing == 0 then setStatus("Матч: команда в сборе"); return end
+        local grace = numOpt("TeamGrace", 20, 5, 60)
+        local left = math.max(0, math.ceil(T.matchSince + grace - now))
+        if left > 0 then
+            setStatus("Матч: нет союзников: " .. table.concat(missing, ", ") .. "; кик через " .. left .. " с")
+            return
+        end
+        if now - T.lastKick < 60 then setStatus("Кик уже выполнялся, ждём"); return end
+        T.lastKick = now
+        if S.playing then stopPlayback("Неполная команда") end
+        S.recording = false
+        problem("team-kick", "Нет союзников: " .. table.concat(missing, ", "))
+        pcall(function() LP:Kick("не обнаружен союзник") end)
+    end
+
+    local function teamTick()
+        if not T.alive or not S.alive or not opt("TeamEnabled", false) then return end
+        local now = os.clock()
+        if now - T.lastPoll < numOpt("TeamPoll", 3, 1, 10) then return end
+        T.lastPoll = now
+        local ok, err = pcall(function()
+            if inConfiguredLobby() then
+                T.matchSince, T.lastKick = nil, -math.huge
+                lobbyPhase(now)
+            else
+                matchPhase(now)
+            end
+        end)
+        if not ok then problem("team", err) end
+    end
+
+    -- Ветвление вместо правки главного цикла: команда перехватывает elevator-слот.
+    local origElevator = elevatorCycle
+    elevatorCycle = function()
+        if T.alive and S.alive and opt("TeamEnabled", false) then teamTick(); return end
+        return origElevator()
+    end
+
+    if managersReady and SaveManager then
+        local origLoad = SaveManager.Load
+        function SaveManager:Load(name)
+            local res = table.pack(origLoad(self, name))
+            if not res[1] then pcall(function() options.TeamEnabled:SetValue(false) end) end
+            return table.unpack(res, 1, res.n)
+        end
+    end
+
+    local origDestroy = hub.Destroy
+    hub.Destroy = function(...)
+        T.alive = false
+        return origDestroy(...)
+    end
+    pcall(function() setStatus("Готов. Вайтлист задаётся в TeamWhitelist") end)
+end
+do
+    -- Autoskip: голос за пропуск при видимом WaveSkipGui; фильтр — только числа.
+    if hub.Skip then return end
+    local SK = { alive = true, lastVote = -math.huge, sentWave = nil, shown = nil }
+    hub.Skip = SK
+
+    -- Номер текущей волны из надписи "Wave: X/Y"; nil при нечитаемой надписи.
+    local function parseWave()
+        local ok, n = pcall(function()
+            local gui = gameGui()
+            local info = gui and gui:FindFirstChild("Info")
+            local stats = info and info:FindFirstChild("Stats")
+            local label = stats and stats:FindFirstChild("Wave")
+            local text = (label and label:IsA("TextLabel")) and label.Text or nil
+            if type(text) ~= "string" then return nil end
+            local v = tonumber(text:match("Wave:%s*(%d+)"))
+            if v and v % 1 == 0 and v >= 1 and v <= 9999 then return v end
+            return nil
+        end)
+        return ok and n or nil
+    end
+    -- Список волн-исключений: только числа через запятую/пробел; мусор игнорируется.
+    local function parseSkipList()
+        local set, bad, n = {}, 0, 0
+        local raw = tostring(opt("SkipWaves", ""))
+        for tok in raw:gsub("[,;]+", " "):gmatch("%S+") do
+            local v = tonumber(tok)
+            if v and v % 1 == 0 and v >= 1 and v <= 9999 and n < 500 then
+                if not set[v] then set[v] = true; n = n + 1 end
+            else bad = bad + 1 end
+        end
+        return set, bad
+    end
+
+    local skipStatus = Tabs.Main:AddParagraph({ Title = "Autoskip", Content = "Инициализация" })
+    Tabs.Main:AddToggle("AutoSkip", { Title = "Auto Skip Wave", Default = false,
+        Description = "Голосовать за пропуск при появлении меню WaveSkipGui." })
+    Tabs.Main:AddToggle("SkipFilter", { Title = "Фильтр волн", Default = false,
+        Description = "Вкл: волны из списка ниже не пропускать." })
+    Tabs.Main:AddInput("SkipWaves", { Title = "Волны-исключения (числа через запятую)", Default = "", Finished = true })
+    local function setStatus(text)
+        if SK.shown ~= text then SK.shown = text end
+        pcall(function() if SK.shown == text then skipStatus:SetDesc(text) end end)
+    end
+
+    worker("skip", function()
+        while SK.alive and S.alive and not Fluent.Unloaded do
+            local ok, err = pcall(function()
+                if not opt("AutoSkip", false) then setStatus("Выключен"); return end
+                local gui = gameGui()
+                local frame = gui and gui:FindFirstChild("WaveSkipGui")
+                if not visible(frame) then SK.sentWave = nil; setStatus("Ожидание меню пропуска"); return end
+                local wave = parseWave()
+                if opt("SkipFilter", false) then
+                    local set, bad = parseSkipList()
+                    if not wave then setStatus("Волна не прочитана — пропуск"); return end
+                    if set[wave] then
+                        SK.sentWave = wave
+                        setStatus("Волна " .. wave .. " в исключениях" .. (bad > 0 and ("; мусорных: " .. bad) or ""))
+                        return
+                    end
+                end
+                if SK.sentWave == wave or os.clock() - SK.lastVote < 2 then return end
+                local r = remote("Functions", "VoteSkip", "RemoteFunction")
+                if not r then problem("skip", "Нет Functions.VoteSkip"); return end
+                local res, callErr = invoke("skip", r, table.pack(),
+                    function() return S.alive and SK.alive and opt("AutoSkip", false) end)
+                SK.lastVote = os.clock()
+                if res then SK.sentWave = wave; setStatus("Пропуск волны: " .. tostring(wave))
+                else problem("skip", callErr) end
+            end)
+            if not ok and SK.alive and S.alive then problem("skip", err) end
+            task.wait(0.5)
+        end
+    end)
+
+    local origDestroy = hub.Destroy
+    hub.Destroy = function(...)
+        SK.alive = false
+        if hub.NewMap then hub.NewMap.alive = false end
+        return origDestroy(...)
+    end
+    pcall(function() setStatus("Готов") end)
+end
+do
+    -- Auto New map: решение отправляется веткой New внутри endCycle; здесь только переключатель.
+    if hub.NewMap then return end
+    hub.NewMap = { alive = true }
+    Tabs.Lobby:AddParagraph({ Title = "Auto New map", Content =
+        "EndDecision(\"new\"). Приоритет: Leave > New map > Replay. Вебхук-барьер держит решение." })
+    Tabs.Lobby:AddToggle("AutoNewMap", { Title = "Auto New map / EndScreen", Default = false,
+        Description = "EndDecision(\"new\"). Приоритет: Leave > New map > Replay." })
+end
+do
+    -- AutoMutator: голос за первый по приоритету Id из списка; совпадений нет — None.
+    if hub.Mutator then return end
+    local MU = { alive = true, votedId = nil }
+    hub.Mutator = MU
+
+    -- Разбор списка приоритетов: порядок = приоритет, первый — главный.
+    local function parsePriority()
+        local out, seen, bad = {}, {}, 0
+        local raw = tostring(opt("MutatorList", ""))
+        for tok in raw:gsub("[,;]+", " "):gmatch("%S+") do
+            if #tok >= 1 and #tok <= 64 and tok:match("^[%w_]+$") and #out < 32 then
+                if not seen[tok] then seen[tok] = true; out[#out + 1] = tok end
+            else bad = bad + 1 end
+        end
+        return out, bad
+    end
+    -- Предложенные Id: имена GuiObject-детей MutatorVoting, кроме UIListLayout.
+    local function offeredIds(frame)
+        local set, list = {}, {}
+        local ok = pcall(function()
+            for _, child in ipairs(frame:GetChildren()) do
+                if child:IsA("GuiObject") and child.Name ~= "UIListLayout" then
+                    if not set[child.Name] then set[child.Name] = true; list[#list + 1] = child.Name end
+                end
+            end
+        end)
+        if not ok then return nil end
+        return set, list
+    end
+
+    local mutStatus = Tabs.Main:AddParagraph({ Title = "AutoMutator", Content = "Инициализация" })
+    Tabs.Main:AddToggle("AutoMutator", { Title = "Auto Vote Mutator", Default = false,
+        Description = "Голосовать за первый по приоритету мутатор из списка." })
+    Tabs.Main:AddInput("MutatorList", { Title = "Мутаторы по приоритету (через запятую)", Finished = true,
+        Default = "BossRush, Speedrun, TinySlop, Regeneration, Blackout, Brainrot, Gigantism, None" })
+    local function setStatus(text) pcall(function() mutStatus:SetDesc(text) end) end
+
+    -- Наблюдатель итога голосования для статуса (тирдаун через connect).
+    pcall(function()
+        local folder = RS:FindFirstChild("Events")
+        local r = folder and folder:FindFirstChild("SlopMutator")
+        if r and r:IsA("RemoteEvent") then
+            connect(r.OnClientEvent, function(kind, data)
+                if not MU.alive or not S.alive or kind ~= "Active" then return end
+                if type(data) == "table" and type(data.Id) == "string" then
+                    setStatus("Активен мутатор: " .. data.Id)
+                end
+            end)
+        end
+    end)
+
+    worker("mutator", function()
+        while MU.alive and S.alive and not Fluent.Unloaded do
+            local ok, err = pcall(function()
+                if not opt("AutoMutator", false) then setStatus("Выключен"); return end
+                local pg = LP:FindFirstChildOfClass("PlayerGui")
+                local gui = pg and pg:FindFirstChild("SlopMutatorGui")
+                local frame = gui and gui:FindFirstChild("MutatorVoting")
+                if not visible(frame) then MU.votedId = nil; setStatus("Ожидание голосования"); return end
+                if MU.votedId then return end
+                local set, list = offeredIds(frame)
+                if not set then setStatus("Не прочитаны варианты"); return end
+                local priority, bad = parsePriority()
+                local pick
+                for _, id in ipairs(priority) do if set[id] then pick = id; break end end
+                if not pick then
+                    if set.None then pick = "None" else setStatus("Своих нет, None нет"); return end
+                end
+                -- Одна попытка на показ: помечаем до отправки.
+                MU.votedId = pick
+                local sent, msg = fire("Events", "SlopMutator", "Vote", pick)
+                if not sent then
+                    MU.votedId = nil
+                    problem("mutator", msg or pick)
+                else
+                    setStatus("Голос: " .. pick .. " (" .. #list .. " вариантов)"
+                        .. (bad > 0 and ("; мусорных: " .. bad) or ""))
+                end
+            end)
+            if not ok and MU.alive and S.alive then problem("mutator", err) end
+            task.wait(0.5)
+        end
+    end)
+
+    local origDestroy = hub.Destroy
+    hub.Destroy = function(...)
+        MU.alive = false
+        return origDestroy(...)
+    end
+    pcall(function() setStatus("Готов") end)
+end
+-- КОНЕЦ ВСТАВКИ. Далее остаётся исходный Window:SelectTab(1).
+Window:SelectTab(1)
+refreshCash()
+refreshRecordCache()
+bindAntiMacro()
+local statusAt = 0
+local lastStatus, lastDiagnostic, lastAnti = "", "", ""
+local function setParagraph(paragraph, text)
+    if paragraph and type(paragraph.SetDesc) == "function" then paragraph:SetDesc(text) end
+end
+-- Фоновые ошибки разделены: сбой одного модуля не отключает остальные.
+local function safeCycle(key, fn)
+    local ok, err = pcall(fn)
+    if not ok then problem(key, err) end
+end
+local function statusCycle()
+    if os.clock() - statusAt < 1 then return end
+    statusAt = os.clock()
+    local count = #S.entries > 0 and #S.entries or #S.macro.steps
+    local mode = S.recording and "Запись" or (S.playing and "Воспроизведение" or "Ожидание")
+    local nextStep = S.playing and S.macro.steps[S.cursor] or nil
+    local text = mode .. " | шагов: " .. count .. " | позиция: " .. S.cursor .. " | Cash: " .. tostring(cashNow())
+        .. " | очередь снимков: " .. S.pending .. (nextStep and (" | порог: " .. nextStep.cash) or "")
+    local ps = LP:FindFirstChild("PlayerScripts")
+    local client = ps and ps:FindFirstChild("AntiMacroClient")
+    local info = WS:FindFirstChild("Info")
+    local wave = info and info:FindFirstChild("Wave")
+    local diagnosticText = "Файлы: " .. tostring(fileOK) .. " | Удаление: " .. tostring(deleteOK)
+        .. " | Hook установлен: " .. tostring(S.recordEnabled) .. " | AntiMacroClient: " .. tostring(client ~= nil)
+        .. " | Wave: " .. tostring(wave and wave.Value) .. "\nПоследняя проблема: " .. S.lastError
+    if text ~= lastStatus then setParagraph(statusParagraph, text); lastStatus = text end
+    if diagnosticText ~= lastDiagnostic then setParagraph(diagnostics, diagnosticText); lastDiagnostic = diagnosticText end
+    if S.antiStatus ~= lastAnti then setParagraph(antiParagraph, S.antiStatus); lastAnti = S.antiStatus end
+end
+task.spawn(function()
+    while S.alive and not Fluent.Unloaded do
+        safeCycle("cash", refreshCash)
+        safeCycle("record-cache", refreshRecordCache)
+        if dispatcher and dispatcher.fault then
+            local fault = dispatcher.fault
+            dispatcher.fault = nil
+            recordingError(fault)
+        end
+        safeCycle("anti-bind", bindAntiMacro)
+        safeCycle("map", function()
+            guiGate("map", "Voting", opt("AutoMap", false), opt("Map", "Area 51"), "VoteForMap", opt("Map", "Area 51"))
+        end)
+        safeCycle("difficulty", function()
+            guiGate("difficulty", "ComplicationVoting", opt("AutoDifficulty", false), opt("Difficulty", "Normal"),
+                "VoteForComplication", opt("Difficulty", "Normal"))
+        end)
+        safeCycle("end", endCycle)
+        safeCycle("elevator", elevatorCycle)
+        safeCycle("speed", speedCycle)
+        safeCycle("walk", walkCycle)
+        safeCycle("pump", hub.Pump)
+        safeCycle("status", statusCycle)
+        task.wait(0.25)
+    end
+    hub.Destroy("Окно закрыто")
+end)
+if managersReady then
+    local ok, err = pcall(function() SaveManager:LoadAutoloadConfig() end)
+    if not ok then problem("autoload", err) end
+end
+hub.CompleteAutoMacroStartup()
+notify("V2 загружен. Хук установится при Start Recording. Требуется проверка в реальном Delta/Roblox.")
+return hub
